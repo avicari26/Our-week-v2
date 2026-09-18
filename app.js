@@ -7,7 +7,11 @@ import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 let sb;
 try {
   if (CONFIG.SUPABASE_URL.includes("YOUR-PROJECT")) throw new Error("config.js still has the placeholder values");
-  sb = createClient(CONFIG.SUPABASE_URL.trim(), CONFIG.SUPABASE_PUBLISHABLE_KEY.trim());
+  // Accept the URL however it was pasted (trailing slash, /rest/v1, etc.) and keep only the base.
+  const base = new URL(CONFIG.SUPABASE_URL.trim()).origin;
+  const key = CONFIG.SUPABASE_PUBLISHABLE_KEY.trim();
+  if (key.startsWith("sb_secret_")) throw new Error("that's the secret key; use the one starting with sb_publishable_");
+  sb = createClient(base, key);
 } catch (e) {
   window.__showFatal?.("config.js problem: " + e.message + "\nSUPABASE_URL should look like https://xxxx.supabase.co and the key should start with sb_publishable_");
   throw e;
