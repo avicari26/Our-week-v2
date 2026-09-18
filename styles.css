@@ -287,7 +287,10 @@ select.input { appearance: none; -webkit-appearance: none; }
 
 /* ---------- Auth ---------- */
 .login { min-height: calc(100vh - 32px); display: flex; flex-direction: column; justify-content: center; }
-.brand img { width: 72px; height: 72px; border-radius: 18px; margin-bottom: 18px; box-shadow: var(--shadow); }
+.brand .logo { position: relative; display: block; width: 72px; height: 72px; border-radius: 18px; margin-bottom: 18px; background: #1B1A2C; box-shadow: var(--shadow); overflow: hidden; }
+.brand .logo i { position: absolute; top: 50%; width: 42px; height: 42px; border-radius: 50%; transform: translateY(-50%); }
+.brand .logo i:first-child { left: 8px; background: rgba(243,166,187,0.92); }
+.brand .logo i:last-child { left: 22px; background: rgba(143,199,232,0.78); }
 .login h1 { font-size: 2.2rem; margin-bottom: 6px; }
 .login .lede { color: var(--muted); margin-bottom: 26px; max-width: 34ch; }
 .auth-toggle { text-align: center; margin-top: 16px; color: var(--muted); }

@@ -240,7 +240,7 @@ function renderAuth(mode = "signin") {
   const pending = sessionStorage.getItem("pendingJoin");
   view.innerHTML = `
     <div class="login">
-      <div class="brand"><img src="/icons/icon-192.png" alt="" /></div>
+      <div class="brand"><span class="logo" aria-hidden="true"><i></i><i></i></span></div>
       <h1>${esc(CONFIG.APP_NAME)}</h1>
       <p class="lede">${pending ? `You've been invited to a circle. ${mode === "signin" ? "Sign in" : "Create an account"} to join it.` : "Everyone in a circle seals a week of photos. Nobody sees anyone else's until you all open it together."}</p>
       ${mode === "signup" ? `
