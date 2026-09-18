@@ -36,6 +36,7 @@ const state = {
   revealState: null,
   reactions: [],
   comments: [],
+  blocks: new Set(),
   favorites: [],
   forced: false,
   urls: new Map(),
@@ -121,9 +122,11 @@ function dayLabel(dateLike) {
 }
 const timeLabel = (d) => new Date(d).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 const hourLabel = (h) => new Date(2000, 0, 1, h).toLocaleTimeString(undefined, { hour: "numeric" });
-function promptForDate(d = new Date()) {
+function promptForDate(d = new Date(), circle = null) {
+  if (circle && circle.prompts_enabled === false) return null;
+  const list = circle?.custom_prompts?.length ? circle.custom_prompts : CONFIG.PROMPTS;
   const dayNum = Math.floor(new Date(d).setHours(0, 0, 0, 0) / 86400000);
-  return CONFIG.PROMPTS[dayNum % CONFIG.PROMPTS.length];
+  return list[dayNum % list.length];
 }
 function countdown(target) {
   const ms = target - Date.now();
@@ -134,7 +137,9 @@ function countdown(target) {
   return `${mins}m`;
 }
 const initials = (name) => (name || "?").trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase();
-const avatar = (p, cls = "") => `<span class="avatar ${cls}" style="background:${p?.color || "#888"}" title="${esc(p?.display_name || "")}">${initials(p?.display_name)}</span>`;
+const avatar = (p, cls = "") => p?.avatar_url
+  ? `<span class="avatar ${cls}" title="${esc(p?.display_name || "")}"><img src="${esc(p.avatar_url)}" alt="" /></span>`
+  : `<span class="avatar ${cls}" style="background:${p?.color || "#888"}" title="${esc(p?.display_name || "")}">${initials(p?.display_name)}</span>`;
 
 let toastTimer;
 function toast(msg, ms = 2600) {
@@ -296,7 +301,12 @@ function renderResetPassword() {
   };
 }
 
+async function loadBlocks() {
+  const { data } = await sb.from("blocks").select("blocked_id");
+  state.blocks = new Set((data || []).map((b) => b.blocked_id));
+}
 async function loadMe() {
+  await loadBlocks();
   const { data } = await sb.from("profiles").select("*").eq("id", state.session.user.id).maybeSingle();
   state.me = data || { id: state.session.user.id, display_name: state.session.user.email.split("@")[0], color: "#8FC7E8" };
 }
@@ -398,7 +408,7 @@ async function renderHome() {
 async function addPhotoFromHome() {
   const circles = state.circles;
   if (!circles.length) return toast("Start or join a circle first");
-  const pick = async (id) => { await enterCircle(id); history.replaceState(null, "", `#/c/${id}/week`); setTab("week"); pickFiles(); };
+  const pick = async (id) => { await enterCircle(id); history.replaceState(null, "", `#/c/${id}/week`); setTab("week"); captureSheet(); };
   if (circles.length === 1) return pick(circles[0].id);
   const wrap = openSheet(`<h2>Add to which circle?</h2><div class="list">${circles.map((c) => `<button class="list-row" data-id="${c.id}"><span class="emoji">${esc(c.emoji)}</span><span class="info"><b>${esc(c.name)}</b></span><span class="chev">›</span></button>`).join("")}</div>`);
   wrap.querySelectorAll(".list-row").forEach((b) => b.onclick = () => { closeSheet(wrap); pick(b.dataset.id); });
@@ -523,7 +533,7 @@ async function loadWeek(weekStart = state.weekStart) {
     sb.from("reveal_force").select("week_start").eq("circle_id", c).eq("week_start", weekStart).maybeSingle(),
   ]);
   const hidden = hiddenPhotos();
-  state.photos = (p.data || []).filter((x) => !hidden.has(x.id));
+  state.photos = (p.data || []).filter((x) => !hidden.has(x.id) && !state.blocks.has(x.user_id));
   state.ready = r.data || [];
   state.revealState = s.data || null;
   state.favorites = f.data || [];
@@ -533,8 +543,8 @@ async function loadWeek(weekStart = state.weekStart) {
     sb.from("reactions").select("*").in("photo_id", ids),
     sb.from("comments").select("*").in("photo_id", ids).order("created_at"),
   ]) : [{ data: [] }, { data: [] }];
-  state.reactions = re.data || [];
-  state.comments = co.data || [];
+  state.reactions = (re.data || []).filter((r) => !state.blocks.has(r.user_id));
+  state.comments = (co.data || []).filter((c) => !state.blocks.has(c.user_id));
   await signUrls(state.photos.filter((x) => x.storage_path).map((x) => x.storage_path));
   checkRevealTransition();
 }
@@ -586,12 +596,41 @@ function subscribe() {
 
 function circleBar(extraRight = "") {
   return `<div class="circle-bar">
-    <button class="back" id="back" aria-label="All circles"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
-    <span class="title">${esc(state.circle.emoji)} ${esc(state.circle.name)}</span>
+    <button class="home-btn" id="back" aria-label="Home"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a2 2 0 0 1-2 2h-4v-6H9v6H5a2 2 0 0 1-2-2z"/></svg><span>Home</span></button>
+    <button class="title switcher" id="switch-circle" aria-label="Switch circle">${esc(state.circle.emoji)} ${esc(state.circle.name)} <span class="chev-small">⌄</span></button>
     ${extraRight}
   </div>`;
 }
-function wireBar() { $("#back")?.addEventListener("click", () => go("#/")); }
+function wireBar() {
+  $("#back")?.addEventListener("click", () => go("#/"));
+  $("#switch-circle")?.addEventListener("click", circleSwitcher);
+}
+async function circleSwitcher() {
+  if (!state.circles.length) await loadCircles();
+  const wrap = openSheet(`<h2>Switch circle</h2><div class="list">${state.circles.map((c) => `<button class="list-row" data-id="${c.id}"><span class="emoji">${esc(c.emoji)}</span><span class="info"><b>${esc(c.name)}</b></span>${c.id === state.circle?.id ? `<span class="muted small">Current</span>` : `<span class="chev">›</span>`}</button>`).join("")}</div>
+    <div class="row" style="margin-top:12px"><button class="btn is-ghost" id="sw-home" style="flex:1">Home</button><button class="btn is-ghost" id="sw-join" style="flex:1">Join with code</button></div>`);
+  wrap.querySelectorAll(".list-row").forEach((b) => b.onclick = () => { closeSheet(wrap); if (b.dataset.id !== state.circle?.id) go(`#/c/${b.dataset.id}/week`); });
+  $("#sw-home", wrap).onclick = () => { closeSheet(wrap); go("#/"); };
+  $("#sw-join", wrap).onclick = () => { closeSheet(wrap); joinSheet(); };
+}
+$("#capture").onclick = () => captureSheet();
+function captureSheet({ prompt = null } = {}) {
+  if (!state.circle) return;
+  const wrap = openSheet(`<div class="menu">
+    <button class="menu-item" id="cam">Take a photo</button>
+    <button class="menu-item" id="lib">Choose from library</button>
+    <button class="menu-item" id="cancel">Cancel</button></div>`);
+  $("#cancel", wrap).onclick = () => closeSheet(wrap);
+  $("#lib", wrap).onclick = () => { closeSheet(wrap); pickFiles({ prompt }); };
+  $("#cam", wrap).onclick = () => { closeSheet(wrap); pendingPrompt = prompt; const i = $("#camera-input"); i.value = ""; i.click(); };
+}
+$("#camera-input").addEventListener("change", async () => {
+  const files = [...$("#camera-input").files];
+  if (!files.length || !state.circle) return;
+  await detailsSheet(files[0], { index: 1, total: 1, prompt: pendingPrompt });
+  pendingPrompt = null;
+  await loadWeek(); rerender();
+});
 
 function groupByDay(photos) {
   const groups = new Map();
@@ -632,33 +671,57 @@ function personSection(profile, photos, { sealed, isMe }) {
   </section>`;
 }
 
+// ---------------- Feed (open weeks) ----------------
+const viewMode = () => lsGet("viewMode", "feed");
+function feedHtml() {
+  const list = [...state.photos].sort((x, y) => (x.taken_at < y.taken_at ? 1 : -1));
+  return `<div class="feed">${list.map((p) => {
+    const mine = p.user_id === state.me.id;
+    const who = mine ? state.me : memberById(p.user_id);
+    const reacts = state.reactions.filter((r) => r.photo_id === p.id);
+    const n = state.comments.filter((c) => c.photo_id === p.id).length;
+    return `<article class="feed-card" data-id="${p.id}">
+      <header class="feed-head">${avatar(who, "is-small")}<b>${esc(mine ? "You" : who.display_name)}</b><span class="muted small">${dayLabel(p.taken_at)}, ${timeLabel(p.taken_at)}</span></header>
+      <button class="feed-img" data-id="${p.id}"><img src="${urlFor(p.storage_path) || p.blur_data}" alt="${esc(p.caption || "")}" loading="lazy" /></button>
+      ${p.caption || p.place_name ? `<div class="feed-body">${p.caption ? `<div class="feed-caption">${esc(p.caption)}</div>` : ""}${p.place_name ? `<div class="muted small">${esc(p.place_name)}</div>` : ""}</div>` : ""}
+      <div class="feed-actions">${reactionsHtml(p.id, reacts)}<button class="btn is-quiet feed-comments" data-id="${p.id}">${n ? `${n} comment${n === 1 ? "" : "s"}` : "Comment"}</button></div>
+    </article>`;
+  }).join("")}</div>`;
+}
+
 // ---------------- Week tab ----------------
 function renderWeek() {
   view.className = "view";
   const revealed = isRevealed();
   const revealAt = revealTimeFor(state.weekStart, state.circle);
-  const prompt = promptForDate();
+  const prompt = promptForDate(new Date(), state.circle);
   const others = state.members.filter((m) => m.user_id !== state.me.id);
   const totalOthers = othersPhotos().length;
 
   view.innerHTML = `
-    ${circleBar(`<span class="pill">${revealed ? "Open" : revealAt < Date.now() ? "Reveal <b>now</b>" : `Reveal <b>${countdown(revealAt)}</b>`}</span>`)}
+    ${circleBar(`<button class="icon-btn" id="map-btn" aria-label="Map"><svg viewBox="0 0 24 24"><path d="M12 21s6-5.5 6-11a6 6 0 0 0-12 0c0 5.5 6 11 6 11z"/><circle cx="12" cy="10" r="2.2"/></svg></button>`)}
     <div class="screen-head" style="margin-bottom:16px">
       <div><div class="kicker">${weekLabel(state.weekStart)}</div><h1>${revealed ? "This week, opened" : "This week"}</h1></div>
+      <span class="pill">${revealed ? "Open" : revealAt < Date.now() ? "Reveal <b>now</b>" : `Reveal <b>${countdown(revealAt)}</b>`}</span>
     </div>
-    <div class="prompt">
+    ${prompt ? `<div class="prompt">
       <div><div class="prompt-label">Today's prompt</div><div class="prompt-text">${esc(prompt)}</div></div>
       <button class="btn is-ghost" id="add-prompt" style="padding:10px 14px">Add</button>
-    </div>
+    </div>` : ""}
+    ${revealed && state.photos.length ? `<div class="seg" style="margin-bottom:16px" id="viewmode"><button data-v="feed" class="${viewMode() === "feed" ? "is-on" : ""}">Feed</button><button data-v="grid" class="${viewMode() === "grid" ? "is-on" : ""}">Grid</button></div>` : ""}
     ${revealed ? `<div class="empty" style="margin-bottom:22px;text-align:left;display:flex;align-items:center;gap:12px;justify-content:space-between"><span>This week is open, so new photos aren't sealed.</span><button class="btn is-quiet" id="newweek" style="flex:none">New week</button></div>` : ""}
     ${state.members.length === 1 ? `<div class="empty" style="margin-bottom:22px">It's just you so far. <button class="btn is-quiet" id="invite" style="padding:0;color:var(--gold)">Invite people</button></div>` : ""}
     ${!revealed && totalOthers ? `<p class="muted small" style="margin-bottom:16px">${totalOthers} sealed photo${totalOthers === 1 ? "" : "s"} from ${others.length} ${others.length === 1 ? "person" : "people"}. You'll see them when everyone taps reveal.</p>` : ""}
-    ${others.map((m) => personSection(m.profile, state.photos.filter((p) => p.user_id === m.user_id), { sealed: !revealed, isMe: false })).join("")}
-    ${personSection(state.me, myPhotos(), { sealed: false, isMe: true })}
-    <button class="fab" id="fab" aria-label="Add photos"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>`;
+    ${revealed && state.photos.length && viewMode() === "feed" ? feedHtml() : `
+      ${others.map((m) => personSection(m.profile, state.photos.filter((p) => p.user_id === m.user_id), { sealed: !revealed, isMe: false })).join("")}
+      ${personSection(state.me, myPhotos(), { sealed: false, isMe: true })}`}`;
   wireBar();
-  $("#fab").onclick = () => pickFiles();
-  $("#add-prompt").onclick = () => pickFiles({ prompt });
+  $("#map-btn").onclick = () => { state.tab = "map"; renderMap(); };
+  $("#add-prompt")?.addEventListener("click", () => captureSheet({ prompt }));
+  view.querySelectorAll("#viewmode button").forEach((b) => b.onclick = () => { lsSet("viewMode", b.dataset.v); renderWeek(); });
+  view.querySelectorAll(".feed-card .feed-img").forEach((b) => b.onclick = () => openLightbox(b.dataset.id));
+  view.querySelectorAll(".feed-card .feed-comments").forEach((b) => b.onclick = () => openLightbox(b.dataset.id));
+  view.querySelectorAll(".feed-card").forEach((card) => wireReactions(card, card.dataset.id, () => renderWeek()));
   $("#invite")?.addEventListener("click", () => go(`#/c/${state.circle.id}/people`));
   $("#newweek")?.addEventListener("click", startNewWeek);
   view.querySelectorAll("button.tile").forEach((b) => b.onclick = () => openLightbox(b.dataset.id));
@@ -1005,7 +1068,7 @@ function renderReveal() {
   if (revealed) {
     action = `<button class="btn is-primary is-block" id="watch">Watch the week together</button>
       <p class="muted small" style="margin-top:12px;text-align:center">Slides stay in sync on everyone's phone. Anyone can tap next.</p>
-      <button class="btn is-ghost is-block" id="newweek" style="margin-top:14px">Start a new week now</button>
+      <div class="row" style="margin-top:14px"><button class="btn is-ghost" id="recap" style="flex:1">Share a recap</button><button class="btn is-ghost" id="newweek" style="flex:1">New week</button></div>
       <p class="muted small" style="margin-top:8px;text-align:center">Otherwise the next week starts on its own ${DAYS[(state.circle.reveal_day + 1) % 7]}.</p>`;
   } else if (!state.photos.length) {
     action = `<div class="empty">Nothing to reveal yet. Once people add photos, this is where you open the week.</div>`;
@@ -1062,7 +1125,40 @@ function renderReveal() {
   });
   $("#watch")?.addEventListener("click", () => startSlideshow());
   $("#newweek")?.addEventListener("click", startNewWeek);
+  $("#recap")?.addEventListener("click", shareRecap);
   $("#pickfav")?.addEventListener("click", () => startSlideshow({ atEnd: true }));
+}
+
+// A 1080x1920 story-sized collage of the week, shared with the phone's share sheet
+async function shareRecap() {
+  const photos = state.photos.filter((p) => p.storage_path).slice(0, 9);
+  if (!photos.length) return toast("Nothing to share yet");
+  toast("Building your recap...", 8000);
+  try {
+    const W = 1080, H = 1920, c = document.createElement("canvas"); c.width = W; c.height = H;
+    const g = c.getContext("2d");
+    const dark = document.documentElement.dataset.theme !== "light";
+    g.fillStyle = dark ? "#000" : "#F6F5F2"; g.fillRect(0, 0, W, H);
+    g.fillStyle = dark ? "#fff" : "#111"; g.textAlign = "center";
+    g.font = "bold 64px -apple-system, Helvetica, Arial, sans-serif"; g.fillText(`${state.circle.emoji} ${state.circle.name}`, W / 2, 190);
+    g.font = "40px -apple-system, Helvetica, Arial, sans-serif"; g.fillStyle = dark ? "#8E8E93" : "#7A7A80"; g.fillText(weekLabel(state.weekStart), W / 2, 260);
+    const cols = photos.length <= 4 ? 2 : 3, gap = 18, size = Math.floor((W - 120 - gap * (cols - 1)) / cols), rows = Math.ceil(photos.length / cols);
+    const top = Math.max(340, (H - (rows * size + (rows - 1) * gap)) / 2);
+    const bitmaps = await Promise.all(photos.map(async (p) => { const r = await fetch(urlFor(p.storage_path)); return createImageBitmap(await r.blob()); }));
+    bitmaps.forEach((bm, i) => {
+      const x = 60 + (i % cols) * (size + gap), y = top + Math.floor(i / cols) * (size + gap);
+      const s = Math.min(bm.width, bm.height);
+      g.save(); g.beginPath(); g.roundRect(x, y, size, size, 28); g.clip();
+      g.drawImage(bm, (bm.width - s) / 2, (bm.height - s) / 2, s, s, x, y, size, size); g.restore();
+    });
+    g.font = "36px -apple-system, Helvetica, Arial, sans-serif"; g.fillStyle = dark ? "#8E8E93" : "#7A7A80";
+    g.fillText(`${state.photos.length} photos · ${state.members.length} people · ${CONFIG.APP_NAME}`, W / 2, H - 120);
+    const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
+    const file = new File([blob], "our-week-recap.jpg", { type: "image/jpeg" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: `${state.circle.name}: ${weekLabel(state.weekStart)}` });
+    else { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = file.name; a.click(); }
+    toast("Recap ready");
+  } catch (e) { toast("Couldn't build the recap: " + e.message, 4000); }
 }
 
 async function startNewWeek() {
@@ -1134,12 +1230,13 @@ async function startSlideshow({ atEnd = false } = {}) {
       idx = i; draw();
       if (!remote && show.sync) sb.from("reveal_state").upsert({ circle_id: state.circle.id, week_start: state.weekStart, slide_index: idx, updated_by: state.me.id, updated_at: new Date().toISOString() }).then(() => {});
     },
-    close: () => { el.remove(); state.show = null; rerender(); },
+    close: () => { clearInterval(autoTimer); el.remove(); state.show = null; rerender(); },
   };
   state.show = show;
 
+  let autoTimer = null;
   const top = (label) => `<div class="show-top"><span class="who">${label}</span><div class="row">
-      <button class="btn is-quiet" id="sync">${show.sync ? "Synced" : "Solo"}</button><button class="btn is-quiet" id="close">Close</button></div></div>`;
+      <button class="btn is-quiet" id="auto" title="Auto-advance">${autoTimer ? "Auto ✓" : "Auto"}</button><button class="btn is-quiet" id="sync">${show.sync ? "Synced" : "Solo"}</button><button class="btn is-quiet" id="close">Close</button></div></div>`;
 
   const draw = () => {
     if (idx >= slides.length) return drawFavorites();
@@ -1200,6 +1297,11 @@ async function startSlideshow({ atEnd = false } = {}) {
   };
   const wire = () => {
     $("#close", el).onclick = () => show.close();
+    $("#auto", el)?.addEventListener("click", () => {
+      if (autoTimer) { clearInterval(autoTimer); autoTimer = null; toast("Auto-advance off"); }
+      else { autoTimer = setInterval(() => { if (idx < slides.length - 1) show.goTo(idx + 1); else { clearInterval(autoTimer); autoTimer = null; draw(); } }, 7000); toast("Advancing every 7 seconds"); }
+      draw();
+    });
     $("#sync", el).onclick = () => { show.sync = !show.sync; draw(); toast(show.sync ? "Synced with the circle" : "Browsing on your own"); };
     $("#prev", el)?.addEventListener("click", () => show.goTo(idx - 1));
     $("#next", el)?.addEventListener("click", () => show.goTo(idx + 1));
@@ -1313,10 +1415,11 @@ function renderPeople() {
       </div>
     </div>`}
     <section class="person-section" style="margin-top:20px">
-      ${state.members.map((m) => `<div class="member-row">${avatar(m.profile)}<span class="name">${esc(m.profile.display_name)}${m.user_id === state.me.id ? ' <span class="muted small">(you)</span>' : ""}</span><span class="role">${m.role === "owner" ? "owner" : ""}</span>${owner && m.user_id !== state.me.id ? `<button class="btn is-quiet" data-makeowner="${m.user_id}" style="padding:8px 6px">Make owner</button><button class="btn is-quiet" data-remove="${m.user_id}" style="color:var(--danger)">Remove</button>` : ""}</div>`).join("")}
+      ${state.members.map((m) => `<div class="member-row">${avatar(m.profile)}<span class="name">${esc(m.profile.display_name)}${m.user_id === state.me.id ? ' <span class="muted small">(you)</span>' : ""}${state.blocks.has(m.user_id) ? ' <span class="muted small">(blocked)</span>' : ""}</span><span class="role">${m.role === "owner" ? "owner" : ""}</span>${m.user_id !== state.me.id ? `<button class="btn is-quiet" data-member-menu="${m.user_id}" aria-label="More">•••</button>` : ""}</div>`).join("")}
     </section>
-    ${owner && state.members.length > 1 ? `<p class="muted small" style="margin-bottom:12px">If you leave, the longest-standing member becomes the owner.</p>` : ""}
-    <button class="btn is-danger" id="leave">Leave circle</button>`;
+    <div class="setting"><label class="toggle-row"><span><b>Mute this circle</b><br><span class="muted small">No notifications from it on any device</span></span><input type="checkbox" id="mute" ${state.members.find((m) => m.user_id === state.me.id)?.muted ? "checked" : ""} /></label></div>
+    ${owner && state.members.length > 1 ? `<p class="muted small" style="margin:12px 0">If you leave, the longest-standing member becomes the owner.</p>` : ""}
+    <button class="btn is-danger" id="leave" style="padding-left:0">Leave circle</button>`;
   wireBar();
   $("#share")?.addEventListener("click", async () => {
     const text = `Join my circle "${c.name}" on ${CONFIG.APP_NAME}. Code: ${c.invite_code}`;
@@ -1325,6 +1428,30 @@ function renderPeople() {
   });
   $("#copy")?.addEventListener("click", async () => { await navigator.clipboard.writeText(c.invite_code); toast("Code copied"); });
   $("#settings")?.addEventListener("click", circleSettingsSheet);
+  $("#mute").onchange = async (e) => {
+    const { error } = await sb.from("circle_members").update({ muted: e.target.checked }).match({ circle_id: c.id, user_id: state.me.id });
+    if (error) return toast(error.message, 4000);
+    await loadMembers(); toast(e.target.checked ? "Muted" : "Unmuted");
+  };
+  view.querySelectorAll("[data-member-menu]").forEach((b) => b.onclick = () => {
+    const uid = b.dataset.memberMenu; const who = memberById(uid); const blocked = state.blocks.has(uid);
+    const wrap = openSheet(`<div class="menu">
+      ${owner ? `<button class="menu-item" id="mm-owner">Make ${esc(who.display_name)} the owner</button>` : ""}
+      <button class="menu-item ${blocked ? "" : "is-danger"}" id="mm-block">${blocked ? "Unblock" : "Block"} ${esc(who.display_name)}</button>
+      ${owner ? `<button class="menu-item is-danger" id="mm-remove">Remove from circle</button>` : ""}
+      <button class="menu-item" id="mm-cancel">Cancel</button></div>`);
+    $("#mm-cancel", wrap).onclick = () => closeSheet(wrap);
+    $("#mm-owner", wrap)?.addEventListener("click", () => { closeSheet(wrap); view.querySelector(`[data-makeowner="${uid}"]`)?.click(); });
+    $("#mm-remove", wrap)?.addEventListener("click", () => { closeSheet(wrap); view.querySelector(`[data-remove="${uid}"]`)?.click(); });
+    $("#mm-block", wrap).onclick = async () => {
+      if (!blocked && !confirm(`Block ${who.display_name}? You won't see their photos, comments, or reactions anywhere, and they won't be told.`)) return;
+      const r = blocked ? await sb.from("blocks").delete().match({ blocker_id: state.me.id, blocked_id: uid }) : await sb.from("blocks").insert({ blocked_id: uid });
+      if (r.error) return toast(r.error.message, 4000);
+      await loadBlocks(); closeSheet(wrap); await loadWeek(); renderPeople(); toast(blocked ? "Unblocked" : "Blocked");
+    };
+  });
+  // hidden buttons the menu delegates to
+  view.insertAdjacentHTML("beforeend", state.members.filter((m) => m.user_id !== state.me.id).map((m) => `<button hidden data-makeowner="${m.user_id}"></button><button hidden data-remove="${m.user_id}"></button>`).join(""));
   view.querySelectorAll("[data-makeowner]").forEach((b) => b.onclick = async () => {
     const who = memberById(b.dataset.makeowner);
     if (!confirm(`Make ${who.display_name} the owner of ${c.name}? You'll become a regular member.`)) return;
@@ -1370,6 +1497,8 @@ function circleSettingsSheet() {
     <div class="field"><label>Time zone</label><div class="row between"><span>${esc(tzLabel(circleTz(c)))}</span>${circleTz(c) !== DEVICE_TZ ? `<button class="chip" id="usetz">Use mine (${esc(tzLabel(DEVICE_TZ))})</button>` : `<span class="muted small">Same as yours</span>`}</div></div>
     <p class="muted small" style="margin-bottom:14px">Changing the reveal day shifts which days count as "this week". Photos already added keep the week they were filed under.</p>
     <div class="field"><label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" id="slock" ${c.locked ? "checked" : ""} /> Lock the circle (no new members)</label></div>
+    <div class="field"><label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" id="sprompts" ${c.prompts_enabled !== false ? "checked" : ""} /> Daily prompts</label></div>
+    <div class="field"><label for="scustom">Your own prompts (optional, one per line)</label><textarea id="scustom" class="input" placeholder="Leave blank to use the built-in ones">${esc((c.custom_prompts || []).join("\n"))}</textarea></div>
     <div class="row between" style="margin-top:8px">
       <button class="btn is-quiet" id="regen">New invite code</button>
       <button class="btn is-primary" id="ssave">Save</button>
@@ -1392,6 +1521,9 @@ function circleSettingsSheet() {
   $("#ssave", wrap).onclick = async () => {
     const patch = { name: $("#sname", wrap).value.trim() || c.name, emoji: $("#semoji", wrap).value.trim() || "📷", reveal_day: Number($("#sday", wrap).value), reveal_hour: Number($("#shour", wrap).value), locked: $("#slock", wrap).checked };
     if (newTz) patch.timezone = newTz;
+    patch.prompts_enabled = $("#sprompts", wrap).checked;
+    const custom = $("#scustom", wrap).value.split("\n").map((s) => s.trim()).filter(Boolean);
+    patch.custom_prompts = custom.length ? custom : null;
     const { error } = await sb.from("circles").update(patch).eq("id", c.id);
     if (error) return toast(error.message, 4000);
     Object.assign(state.circle, patch);
@@ -1406,14 +1538,18 @@ function renderMe() {
   view.className = "view";
   const colors = ["#8FC7E8", "#F3A6BB", "#E9C46A", "#9FE3C0", "#C8A9F0", "#F5B48A", "#8DD3C7", "#F6C1E6"];
   view.innerHTML = `
-    <div class="screen-head"><div><div class="kicker">${esc(state.session.user.email)}</div><h1>You</h1></div>${avatar(state.me)}</div>
+    <div class="screen-head"><div><div class="kicker">${esc(state.session.user.email)}</div><h1>You</h1></div><button class="avatar-edit" id="avatar-btn" aria-label="Change photo">${avatar(state.me, "is-big")}<span>Edit</span></button></div>
     <div class="setting"><label class="muted small" for="name">Your name</label>
       <div class="row" style="margin-top:6px"><input id="name" class="input" value="${esc(state.me.display_name)}" /><button class="btn is-ghost" id="savename">Save</button></div></div>
     <div class="setting"><div class="muted small" style="margin-bottom:8px">Your color</div>
       <div class="swatches">${colors.map((c) => `<button class="swatch ${state.me.color === c ? "is-on" : ""}" data-c="${c}" style="background:${c}" aria-label="${c}"></button>`).join("")}</div></div>
     <div class="setting"><div class="muted small" style="margin-bottom:8px">Appearance</div>
-      <div class="seg" id="theme">${[["midnight","Midnight"],["paper","Paper"],["ocean","Ocean"]].map(([k, l]) => `<button data-t="${k}" class="${currentTheme() === k ? "is-on" : ""}">${l}</button>`).join("")}</div></div>
-    <div class="setting"><div class="muted small">On iPhone</div><p style="margin:4px 0 0">Open this in Safari, tap Share, then "Add to Home Screen" to get it as an app.</p></div>
+      <div class="seg" id="theme">${[["auto","Auto"],["dark","Dark"],["light","Light"]].map(([k, l]) => `<button data-t="${k}" class="${currentTheme() === k ? "is-on" : ""}">${l}</button>`).join("")}</div>
+      <div class="muted small" style="margin:14px 0 8px">Accent</div>
+      <div class="swatches" id="accents">${Object.entries(ACCENTS).map(([k, c]) => `<button class="swatch ${currentAccent() === k ? "is-on" : ""}" data-a="${k}" style="background:${c}" aria-label="${k}"></button>`).join("")}</div></div>
+    ${notificationsSettingHtml()}
+    <div class="setting"><div class="muted small">On iPhone</div><p style="margin:4px 0 0">Open this in Safari, tap Share, then "Add to Home Screen" to get it as an app. Notifications only work from the home-screen version.</p></div>
+    <div class="setting"><a class="btn is-quiet" href="/privacy.html" target="_blank" rel="noopener" style="padding-left:0">Privacy policy</a></div>
     <div class="setting"><button class="btn is-ghost" id="changepw">Change password</button></div>
     <div class="setting"><button class="btn is-ghost" id="signout">Sign out</button></div>
     <div class="setting"><button class="btn is-danger" id="delete">Delete my account</button><p class="muted small" style="margin-top:6px">Removes you from every circle and deletes your photos. Can't be undone.</p></div>`;
@@ -1423,7 +1559,10 @@ function renderMe() {
     state.me.display_name = display_name; toast("Saved");
   };
   view.querySelectorAll(".swatch").forEach((b) => b.onclick = async () => { await sb.from("profiles").update({ color: b.dataset.c }).eq("id", state.me.id); state.me.color = b.dataset.c; renderMe(); });
-  view.querySelectorAll("#theme button").forEach((b) => b.onclick = () => { applyTheme(b.dataset.t); renderMe(); });
+  view.querySelectorAll("#theme button").forEach((b) => b.onclick = () => { lsSet("theme2", b.dataset.t); applyAppearance(); renderMe(); });
+  view.querySelectorAll("#accents .swatch").forEach((b) => b.onclick = () => { lsSet("accent", b.dataset.a); applyAppearance(); renderMe(); });
+  wireNotificationSettings();
+  $("#avatar-btn")?.addEventListener("click", () => { $("#avatar-input").value = ""; $("#avatar-input").click(); });
   $("#changepw").onclick = () => {
     const wrap = openSheet(`<h2>Change password</h2>
       <div class="field"><label for="npw">New password</label><input id="npw" class="input" type="password" autocomplete="new-password" placeholder="At least 8 characters" /></div>
@@ -1448,23 +1587,126 @@ function renderMe() {
 }
 
 // ===============================================================
-// Appearance
+// Profile photo
 // ===============================================================
-const DEFAULT_THEME = "midnight";
-function currentTheme() { try { return localStorage.getItem("theme") || DEFAULT_THEME; } catch { return DEFAULT_THEME; } }
-function applyTheme(t) {
-  document.documentElement.dataset.theme = t;
-  try { localStorage.setItem("theme", t); } catch {}
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.content = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#000";
+$("#avatar-input").addEventListener("change", async () => {
+  const file = $("#avatar-input").files[0]; if (!file) return;
+  const img = await loadImage(file).catch(() => null);
+  if (!img) return toast("Couldn't read that photo");
+  // square crop, 256px
+  const s = Math.min(img.naturalWidth, img.naturalHeight);
+  const c = document.createElement("canvas"); c.width = c.height = 256;
+  c.getContext("2d").drawImage(img, (img.naturalWidth - s) / 2, (img.naturalHeight - s) / 2, s, s, 0, 0, 256, 256);
+  const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.85));
+  const path = `${state.me.id}/avatar.jpg`;
+  const up = await sb.storage.from("avatars").upload(path, blob, { contentType: "image/jpeg", upsert: true });
+  if (up.error) return toast("Upload failed: " + up.error.message, 4000);
+  const { data } = sb.storage.from("avatars").getPublicUrl(path);
+  const avatar_url = data.publicUrl + "?v=" + Date.now();
+  await sb.from("profiles").update({ avatar_url }).eq("id", state.me.id);
+  state.me.avatar_url = avatar_url; toast("Photo updated"); renderMe();
+});
+
+// ===============================================================
+// Push notifications (device subscription + per-event preferences)
+// ===============================================================
+const NOTIFY_EVENTS = [
+  ["photo", "Someone adds a photo"],
+  ["ready", "Someone taps ready"],
+  ["waiting", "Everyone's waiting on you"],
+  ["open", "A week opens"],
+  ["comment", "Comments on your photos"],
+  ["reaction", "Reactions on your photos"],
+  ["member", "Someone joins a circle"],
+  ["reminder", "Reveal-night reminder"],
+];
+const pushSupported = () => !!(CONFIG.VAPID_PUBLIC_KEY && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window);
+const isInstalled = () => window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+async function currentSubscription() { try { const reg = await navigator.serviceWorker.ready; return await reg.pushManager.getSubscription(); } catch { return null; } }
+function urlB64ToUint8(s) { const p = "=".repeat((4 - (s.length % 4)) % 4); const b = atob((s + p).replace(/-/g, "+").replace(/_/g, "/")); return Uint8Array.from([...b].map((c) => c.charCodeAt(0))); }
+async function enablePush() {
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") return toast("Notifications are blocked for this app in your phone's settings.", 4500);
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(CONFIG.VAPID_PUBLIC_KEY) });
+  const j = sub.toJSON();
+  const { error } = await sb.from("push_subscriptions").upsert({ endpoint: j.endpoint, keys: j.keys, user_agent: navigator.userAgent.slice(0, 200) });
+  if (error) return toast(error.message, 4000);
+  toast("Notifications on for this device");
 }
-document.documentElement.dataset.theme = currentTheme();
+async function disablePush() {
+  const sub = await currentSubscription();
+  if (sub) { await sb.from("push_subscriptions").delete().eq("endpoint", sub.endpoint); await sub.unsubscribe(); }
+  toast("Notifications off for this device");
+}
+function notificationsSettingHtml() {
+  if (!pushSupported()) return `<div class="setting"><div class="muted small">Notifications</div><p style="margin:4px 0 0" class="muted">${!CONFIG.VAPID_PUBLIC_KEY ? "Not set up yet." : "Not available in this browser."}${!isInstalled() ? " On iPhone, add the app to your home screen first." : ""}</p></div>`;
+  const n = state.me.notify || {};
+  return `<div class="setting" id="notif">
+    <div class="row between"><div><div style="font-weight:600">Notifications</div><div class="muted small" id="notif-state">Checking...</div></div><button class="btn is-ghost" id="notif-toggle">...</button></div>
+    <div id="notif-prefs" style="margin-top:12px">${NOTIFY_EVENTS.map(([k, l]) => `<label class="toggle-row"><span>${l}</span><input type="checkbox" data-pref="${k}" ${n[k] !== false ? "checked" : ""} /></label>`).join("")}</div>
+  </div>`;
+}
+async function wireNotificationSettings() {
+  const btn = $("#notif-toggle"), st = $("#notif-state");
+  if (!btn) return;
+  const refresh = async () => {
+    const sub = await currentSubscription();
+    const on = !!sub && Notification.permission === "granted";
+    st.textContent = on ? "On for this device" : !isInstalled() && /iPhone|iPad/.test(navigator.userAgent) ? "Add to home screen to enable" : "Off on this device";
+    btn.textContent = on ? "Turn off" : "Turn on";
+    btn.onclick = async () => { btn.disabled = true; try { on ? await disablePush() : await enablePush(); } catch (e) { toast(e.message, 4000); } btn.disabled = false; refresh(); };
+  };
+  refresh();
+  view.querySelectorAll("[data-pref]").forEach((cb) => cb.onchange = async () => {
+    const notify = { ...(state.me.notify || {}) };
+    view.querySelectorAll("[data-pref]").forEach((x) => (notify[x.dataset.pref] = x.checked));
+    state.me.notify = notify;
+    await sb.from("profiles").update({ notify }).eq("id", state.me.id);
+  });
+}
+
+// ===============================================================
+// Appearance: theme (dark / light / auto) + accent color
+// ===============================================================
+const ACCENTS = { blue: "#3B8BFF", coral: "#FF5A5F", mint: "#2ED3A0", lavender: "#9B7BFF", orange: "#FF8A3D", rose: "#FF6FAE" };
+function currentTheme() { return lsGet("theme2", "auto"); }
+function currentAccent() { return lsGet("accent", "blue"); }
+function applyAppearance() {
+  const t = currentTheme();
+  const dark = t === "dark" || (t === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  document.documentElement.dataset.accent = currentAccent();
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = dark ? "#000000" : "#F6F5F2";
+}
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyAppearance);
+applyAppearance();
 
 // ===============================================================
 // Boot
 // ===============================================================
+function onboarding() {
+  const slides = [
+    ["📷", "Add photos all week", "From the camera or your library. Caption them, tag a place, answer the day's prompt."],
+    ["🔒", "Nobody sees them yet", "Everyone else in your circle only sees a blurred tile and a count until the week opens."],
+    ["✨", "Open it together", "On reveal night everyone taps, the seals come off, and a synced slideshow plays on every phone."],
+  ];
+  let i = 0;
+  const wrap = openSheet(`<div id="ob"></div>`, { onClose: () => lsSet("onboarded", true) });
+  const draw = () => {
+    const [ico, h, p] = slides[i];
+    $("#ob", wrap).innerHTML = `<div class="onboard"><div class="ob-icon">${ico}</div><h2>${h}</h2><p class="muted">${p}</p>
+      <div class="ob-dots">${slides.map((_, k) => `<i class="${k === i ? "is-on" : ""}"></i>`).join("")}</div>
+      <button class="btn is-primary is-block" id="ob-next">${i === slides.length - 1 ? "Let's go" : "Next"}</button></div>`;
+    $("#ob-next", wrap).onclick = () => { if (i < slides.length - 1) { i++; draw(); } else { lsSet("onboarded", true); closeSheet(wrap); } };
+  };
+  draw();
+}
+
 async function boot() {
   await loadMe();
+  if (!lsGet("onboarded", false)) setTimeout(onboarding, 400);
   const pending = sessionStorage.getItem("pendingJoin");
   if (pending) {
     sessionStorage.removeItem("pendingJoin");
