@@ -35,7 +35,9 @@ const state = {
   ready: [],
   revealState: null,
   reactions: [],
+  comments: [],
   favorites: [],
+  forced: false,
   urls: new Map(),
   channel: null,
   show: null,
@@ -49,25 +51,65 @@ const isoDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getD
 const parseIso = (s) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
 const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
+const DEVICE_TZ = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return "America/New_York"; } })();
+const circleTz = (circle) => circle?.timezone || DEVICE_TZ;
+
+// Wall-clock parts of an instant in a given time zone
+const _fmtCache = {};
+function zoned(date, tz) {
+  const f = _fmtCache[tz] ||= new Intl.DateTimeFormat("en-US", { timeZone: tz, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", weekday: "short", hour12: false });
+  const p = Object.fromEntries(f.formatToParts(new Date(date)).map((x) => [x.type, x.value]));
+  return { y: +p.year, m: +p.month, d: +p.day, h: (+p.hour) % 24, dow: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(p.weekday) };
+}
+// The instant when a wall-clock time happens in a given zone
+function zonedToDate(y, m, d, h, tz) {
+  const want = Date.UTC(y, m - 1, d, h);
+  let guess = want;
+  for (let i = 0; i < 2; i++) {
+    const z = zoned(new Date(guess), tz);
+    guess += want - Date.UTC(z.y, z.m - 1, z.d, z.h);
+  }
+  return new Date(guess);
+}
+const isoFromParts = (y, m, d) => `${y}-${pad(m)}-${pad(d)}`;
+const shiftIso = (iso, days) => { const [y, m, d] = iso.split("-").map(Number); const t = new Date(Date.UTC(y, m - 1, d + days)); return isoFromParts(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate()); };
+const dowOfIso = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)).getUTCDay(); };
+
 function weekStartsOn(circle) { return (circle.reveal_day + 1) % 7; }
-function weekStartOf(date, circle) {
-  const d = new Date(date); d.setHours(0, 0, 0, 0);
-  const diff = (d.getDay() - weekStartsOn(circle) + 7) % 7;
-  d.setDate(d.getDate() - diff);
-  return d;
+// Calendar week (as YYYY-MM-DD) that an instant falls in, in the circle's zone
+function calendarWeekIso(date, circle) {
+  const z = zoned(date, circleTz(circle));
+  const diff = (z.dow - weekStartsOn(circle) + 7) % 7;
+  return shiftIso(isoFromParts(z.y, z.m, z.d), -diff);
 }
+function todayIso(circle) { const z = zoned(new Date(), circleTz(circle)); return isoFromParts(z.y, z.m, z.d); }
+// Which week does a moment belong to? The calendar week, unless the circle
+// started a fresh week manually after that moment.
+function weekStartFor(date, circle) {
+  const calendar = calendarWeekIso(date, circle);
+  if (circle.current_week_start && circle.week_started_at && new Date(date) >= new Date(circle.week_started_at)) {
+    return calendar > circle.current_week_start ? calendar : circle.current_week_start;
+  }
+  return calendar;
+}
+// The week ends at the next reveal day after it starts, at the reveal hour, in the circle's zone
 function revealTimeFor(weekStartIso, circle) {
-  const d = parseIso(weekStartIso);
-  d.setDate(d.getDate() + 6);
-  d.setHours(circle.reveal_hour, 0, 0, 0);
-  return d;
+  const [y, m, d] = revealDateIso(weekStartIso, circle).split("-").map(Number);
+  return zonedToDate(y, m, d, circle.reveal_hour, circleTz(circle));
 }
-function weekLabel(weekStartIso) {
+// Calendar date (in the circle's zone) that a week opens on
+function revealDateIso(weekStartIso, circle) {
+  let iso = weekStartIso;
+  do { iso = shiftIso(iso, 1); } while (dowOfIso(iso) !== circle.reveal_day);
+  return iso;
+}
+function weekLabel(weekStartIso, circle = state.circle) {
   const a = parseIso(weekStartIso);
-  const b = new Date(a); b.setDate(a.getDate() + 6);
+  const b = circle ? parseIso(revealDateIso(weekStartIso, circle)) : new Date(a.getTime() + 6 * 86400000);
   const f = (d) => d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   return `${f(a)} to ${f(b)}`;
 }
+const tzLabel = (tz) => { try { return tz.split("/").pop().replace(/_/g, " "); } catch { return tz; } };
 function dayLabel(dateLike) {
   const d = new Date(dateLike);
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -139,9 +181,13 @@ async function route() {
   if (parts[0] === "c" && parts[1]) {
     const tab = parts[2] || "week";
     if (!state.circle || state.circle.id !== parts[1]) {
+      tabsEl.hidden = true; homeTabsEl.hidden = true;
+      view.className = "view";
+      view.innerHTML = `<div class="loading"><div class="spinner"></div><p class="muted">Opening circle...</p></div>`;
       const ok = await enterCircle(parts[1]);
       if (!ok) return go("#/");
     }
+    markSeen(parts[1]);
     setTab(tab);
     return;
   }
@@ -255,6 +301,13 @@ async function loadMe() {
   state.me = data || { id: state.session.user.id, display_name: state.session.user.email.split("@")[0], color: "#8FC7E8" };
 }
 
+// ---------- small persistent bits (per device) ----------
+const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const hiddenPhotos = () => new Set(lsGet("hiddenPhotos", []));
+const markSeen = (circleId) => lsSet("seen:" + circleId, Date.now());
+const lastSeen = (circleId) => lsGet("seen:" + circleId, 0);
+
 // ===============================================================
 // Home
 // ===============================================================
@@ -273,9 +326,9 @@ async function renderHome() {
   const status = {};
   if (circles.length) {
     const ids = circles.map((c) => c.id);
-    const weeks = Object.fromEntries(circles.map((c) => [c.id, isoDate(weekStartOf(new Date(), c))]));
+    const weeks = Object.fromEntries(circles.map((c) => [c.id, weekStartFor(new Date(), c)]));
     const [{ data: photos }, { data: ready }] = await Promise.all([
-      sb.from("photos_view").select("circle_id,user_id,week_start").in("circle_id", ids),
+      sb.from("photos_view").select("circle_id,user_id,week_start,created_at").in("circle_id", ids),
       sb.from("reveal_ready").select("circle_id,user_id,week_start").in("circle_id", ids),
     ]);
     for (const c of circles) {
@@ -285,19 +338,22 @@ async function renderHome() {
       const mine = ps.filter((p) => p.user_id === state.me.id).length;
       const revealed = rs.size > 0 && contribs.every((u) => rs.has(u));
       const waitingOnMe = !revealed && contribs.includes(state.me.id) && !rs.has(state.me.id) && contribs.filter((u) => !rs.has(u)).length === 1;
-      status[c.id] = { mine, others: ps.length - mine, revealed, waitingOnMe, anyReady: rs.size > 0, revealAt: revealTimeFor(weeks[c.id], c) };
+      const seen = lastSeen(c.id);
+      const fresh = (photos || []).filter((p) => p.circle_id === c.id && p.user_id !== state.me.id && new Date(p.created_at).getTime() > seen).length;
+      status[c.id] = { mine, others: ps.length - mine, revealed, waitingOnMe, anyReady: rs.size > 0, fresh, revealAt: revealTimeFor(weeks[c.id], c) };
     }
   }
 
   const line = (c) => {
     const s = status[c.id];
-    if (s.revealed) return `<span class="status is-good">This week is open</span>`;
+    if (s.revealed) return `<span class="status is-good">This week is open${s.fresh ? ` · ${s.fresh} new` : ""}</span>`;
     if (s.waitingOnMe) return `<span class="status is-hot">Everyone's waiting on you to reveal</span>`;
     if (s.anyReady) return `<span class="status is-hot">Someone's ready to reveal</span>`;
     const parts = [];
+    if (s.fresh) parts.push(`<b class="new">${s.fresh} new</b>`);
     if (s.others) parts.push(`${s.others} sealed`);
     parts.push(`${s.mine} from you`);
-    return `<span class="status">${parts.join(", ")} · reveal in ${countdown(s.revealAt)}</span>`;
+    return `<span class="status">${parts.join(", ")} · ${s.revealAt < Date.now() ? "reveal time has passed" : "reveal in " + countdown(s.revealAt)}</span>`;
   };
 
   view.innerHTML = `
@@ -398,13 +454,13 @@ function createCircleSheet() {
       <div class="field" style="flex:1"><label for="rday">Reveal day</label><select id="rday" class="input">${DAYS.map((d, i) => `<option value="${i}" ${i === 0 ? "selected" : ""}>${d}</option>`).join("")}</select></div>
       <div class="field" style="flex:1"><label for="rhour">Time</label><select id="rhour" class="input">${Array.from({ length: 24 }, (_, h) => `<option value="${h}" ${h === 20 ? "selected" : ""}>${hourLabel(h)}</option>`).join("")}</select></div>
     </div>
-    <p class="muted small" style="margin-bottom:14px">The week runs from the day after reveal day to reveal day. The time is just a countdown; the week opens whenever everyone taps.</p>
+    <p class="muted small" style="margin-bottom:14px">The week runs from the day after reveal day to reveal day, in your time zone (${esc(tzLabel(DEVICE_TZ))}). The time is a countdown; the week opens whenever everyone taps.</p>
     <div class="error-text" id="cerr"></div>
     <button class="btn is-primary is-block" id="csave">Create and get invite code</button>`);
   wrap.querySelectorAll("#emojis .chip").forEach((b) => b.onclick = () => { emoji = b.dataset.e; wrap.querySelectorAll("#emojis .chip").forEach((x) => x.classList.toggle("is-on", x === b)); });
   $("#csave", wrap).onclick = async (e) => {
     e.currentTarget.disabled = true;
-    const { data, error } = await sb.rpc("create_circle", { p_name: $("#cname", wrap).value, p_emoji: emoji, p_reveal_day: Number($("#rday", wrap).value), p_reveal_hour: Number($("#rhour", wrap).value) });
+    const { data, error } = await sb.rpc("create_circle", { p_name: $("#cname", wrap).value, p_emoji: emoji, p_reveal_day: Number($("#rday", wrap).value), p_reveal_hour: Number($("#rhour", wrap).value), p_timezone: DEVICE_TZ });
     if (error) { $("#cerr", wrap).textContent = error.message; e.currentTarget.disabled = false; return; }
     closeSheet(wrap);
     go(`#/c/${data.id}/people`);
@@ -438,7 +494,7 @@ async function enterCircle(id) {
   const { data: circle } = await sb.from("circles").select("*").eq("id", id).maybeSingle();
   if (!circle) { toast("That circle isn't available"); return false; }
   state.circle = circle;
-  state.weekStart = isoDate(weekStartOf(new Date(), circle));
+  state.weekStart = weekStartFor(new Date(), circle);
   state.urls = new Map();
   await loadMembers();
   await loadWeek();
@@ -459,18 +515,26 @@ const memberById = (id) => state.members.find((m) => m.user_id === id)?.profile 
 
 async function loadWeek(weekStart = state.weekStart) {
   const c = state.circle.id;
-  const [p, r, s, f] = await Promise.all([
+  const [p, r, s, f, fo] = await Promise.all([
     sb.from("photos_view").select("*").eq("circle_id", c).eq("week_start", weekStart).order("taken_at"),
     sb.from("reveal_ready").select("*").eq("circle_id", c).eq("week_start", weekStart),
     sb.from("reveal_state").select("*").eq("circle_id", c).eq("week_start", weekStart).maybeSingle(),
     sb.from("favorites").select("*").eq("circle_id", c).eq("week_start", weekStart),
+    sb.from("reveal_force").select("week_start").eq("circle_id", c).eq("week_start", weekStart).maybeSingle(),
   ]);
-  state.photos = p.data || [];
+  const hidden = hiddenPhotos();
+  state.photos = (p.data || []).filter((x) => !hidden.has(x.id));
   state.ready = r.data || [];
   state.revealState = s.data || null;
   state.favorites = f.data || [];
+  state.forced = !!fo.data;
   const ids = state.photos.map((x) => x.id);
-  state.reactions = ids.length ? (await sb.from("reactions").select("*").in("photo_id", ids)).data || [] : [];
+  const [re, co] = ids.length ? await Promise.all([
+    sb.from("reactions").select("*").in("photo_id", ids),
+    sb.from("comments").select("*").in("photo_id", ids).order("created_at"),
+  ]) : [{ data: [] }, { data: [] }];
+  state.reactions = re.data || [];
+  state.comments = co.data || [];
   await signUrls(state.photos.filter((x) => x.storage_path).map((x) => x.storage_path));
   checkRevealTransition();
 }
@@ -485,7 +549,7 @@ const urlFor = (path) => state.urls.get(path) || "";
 // Reveal rule, mirrored from the database function.
 const contributors = () => [...new Set(state.photos.map((p) => p.user_id))];
 const readySet = () => new Set(state.ready.map((r) => r.user_id));
-const isRevealed = () => state.ready.length > 0 && contributors().every((u) => readySet().has(u));
+const isRevealed = () => state.forced || (state.ready.length > 0 && contributors().every((u) => readySet().has(u)));
 const iAmReady = () => readySet().has(state.me.id);
 const myPhotos = () => state.photos.filter((p) => p.user_id === state.me.id);
 const othersPhotos = () => state.photos.filter((p) => p.user_id !== state.me.id);
@@ -500,7 +564,18 @@ function subscribe() {
     .on("postgres_changes", { event: "*", schema: "public", table: "reveal_ready", filter: filt }, refresh)
     .on("postgres_changes", { event: "*", schema: "public", table: "favorites", filter: filt }, refresh)
     .on("postgres_changes", { event: "*", schema: "public", table: "reactions" }, refresh)
+    .on("postgres_changes", { event: "*", schema: "public", table: "comments" }, refresh)
+    .on("postgres_changes", { event: "*", schema: "public", table: "reveal_force", filter: filt }, refresh)
     .on("postgres_changes", { event: "*", schema: "public", table: "circle_members", filter: filt }, async () => { await loadMembers(); rerender(); })
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "circles", filter: `id=eq.${state.circle.id}` }, async (payload) => {
+      if (!payload.new) return;
+      const before = state.weekStart;
+      Object.assign(state.circle, payload.new);
+      state.weekStart = weekStartFor(new Date(), state.circle);
+      await loadWeek();
+      if (state.weekStart !== before && !state.show) toast("A new week just started");
+      rerender();
+    })
     .on("postgres_changes", { event: "*", schema: "public", table: "reveal_state", filter: filt }, (payload) => {
       if (!payload.new || payload.new.week_start !== state.weekStart) return;
       state.revealState = payload.new;
@@ -567,7 +642,7 @@ function renderWeek() {
   const totalOthers = othersPhotos().length;
 
   view.innerHTML = `
-    ${circleBar(`<span class="pill">${revealed ? "Open" : `Reveal <b>${countdown(revealAt)}</b>`}</span>`)}
+    ${circleBar(`<span class="pill">${revealed ? "Open" : revealAt < Date.now() ? "Reveal <b>now</b>" : `Reveal <b>${countdown(revealAt)}</b>`}</span>`)}
     <div class="screen-head" style="margin-bottom:16px">
       <div><div class="kicker">${weekLabel(state.weekStart)}</div><h1>${revealed ? "This week, opened" : "This week"}</h1></div>
     </div>
@@ -575,6 +650,7 @@ function renderWeek() {
       <div><div class="prompt-label">Today's prompt</div><div class="prompt-text">${esc(prompt)}</div></div>
       <button class="btn is-ghost" id="add-prompt" style="padding:10px 14px">Add</button>
     </div>
+    ${revealed ? `<div class="empty" style="margin-bottom:22px;text-align:left;display:flex;align-items:center;gap:12px;justify-content:space-between"><span>This week is open, so new photos aren't sealed.</span><button class="btn is-quiet" id="newweek" style="flex:none">New week</button></div>` : ""}
     ${state.members.length === 1 ? `<div class="empty" style="margin-bottom:22px">It's just you so far. <button class="btn is-quiet" id="invite" style="padding:0;color:var(--gold)">Invite people</button></div>` : ""}
     ${!revealed && totalOthers ? `<p class="muted small" style="margin-bottom:16px">${totalOthers} sealed photo${totalOthers === 1 ? "" : "s"} from ${others.length} ${others.length === 1 ? "person" : "people"}. You'll see them when everyone taps reveal.</p>` : ""}
     ${others.map((m) => personSection(m.profile, state.photos.filter((p) => p.user_id === m.user_id), { sealed: !revealed, isMe: false })).join("")}
@@ -584,6 +660,7 @@ function renderWeek() {
   $("#fab").onclick = () => pickFiles();
   $("#add-prompt").onclick = () => pickFiles({ prompt });
   $("#invite")?.addEventListener("click", () => go(`#/c/${state.circle.id}/people`));
+  $("#newweek")?.addEventListener("click", startNewWeek);
   view.querySelectorAll("button.tile").forEach((b) => b.onclick = () => openLightbox(b.dataset.id));
 }
 
@@ -596,6 +673,14 @@ fileInput.addEventListener("change", async () => {
   for (let i = 0; i < files.length; i++) {
     const done = await detailsSheet(files[i], { index: i + 1, total: files.length, prompt: pendingPrompt });
     if (done === "cancel") break;
+    if (done === "rest") {
+      const rest = files.slice(i + 1);
+      toast(`Adding ${rest.length} more...`, 60000);
+      let n = 0;
+      for (const f of rest) { if (await quickUpload(f, pendingPrompt)) n++; }
+      toast(`Added ${n} photo${n === 1 ? "" : "s"}`);
+      break;
+    }
   }
   pendingPrompt = null;
   await loadWeek(); rerender();
@@ -644,6 +729,36 @@ async function reverseGeocode(lat, lng) {
 }
 const blobToBase64 = (blob) => new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result.split(",")[1]); r.readAsDataURL(blob); });
 
+// Prepare a file for upload: compressed JPEG, blur teaser, EXIF date/GPS, week
+async function prepareFile(file) {
+  const img = await loadImage(file).catch(() => null);
+  if (!img) return null;
+  const [full, small] = await Promise.all([drawTo(img, CONFIG.MAX_EDGE, CONFIG.JPEG_QUALITY), drawTo(img, 800, 0.7)]);
+  const blur = blurDataUrl(img);
+  const exif = await readExif(file);
+  const takenAt = exif.takenAt || new Date(file.lastModified || Date.now());
+  const wk = weekStartFor(takenAt, state.circle);
+  return { full, small, blur, takenAt, wk, lat: exif.lat, lng: exif.lng };
+}
+async function uploadPrepared(prep, { caption = null, place = null, prompt = null } = {}) {
+  const id = crypto.randomUUID();
+  const path = `${state.circle.id}/${prep.wk}/${state.me.id}/${id}.jpg`;
+  const up = await sb.storage.from("photos").upload(path, prep.full, { contentType: "image/jpeg", upsert: false });
+  if (up.error) throw new Error("Upload failed: " + up.error.message);
+  const ins = await sb.from("photos").insert({ id, circle_id: state.circle.id, week_start: prep.wk, taken_at: prep.takenAt.toISOString(), storage_path: path, blur_data: prep.blur, caption, place_name: place, lat: prep.lat, lng: prep.lng, prompt });
+  if (ins.error) throw new Error("Couldn't save: " + ins.error.message);
+  return id;
+}
+async function quickUpload(file, prompt) {
+  try {
+    const prep = await prepareFile(file);
+    if (!prep) return false;
+    const place = prep.lat != null ? await reverseGeocode(prep.lat, prep.lng) : null;
+    await uploadPrepared(prep, { place: place || null, prompt });
+    return true;
+  } catch (e) { toast(e.message, 4000); return false; }
+}
+
 function detailsSheet(file, { index, total, prompt }) {
   return new Promise(async (resolve) => {
     const img = await loadImage(file).catch(() => null);
@@ -652,7 +767,7 @@ function detailsSheet(file, { index, total, prompt }) {
     const blur = blurDataUrl(img);
     const exif = await readExif(file);
     const takenAt = exif.takenAt || new Date(file.lastModified || Date.now());
-    const wk = isoDate(weekStartOf(takenAt, state.circle));
+    const wk = weekStartFor(takenAt, state.circle);
     let place = "", lat = exif.lat, lng = exif.lng;
     if (lat != null && lng != null) place = await reverseGeocode(lat, lng);
     let usePrompt = !!prompt;
@@ -683,7 +798,8 @@ function detailsSheet(file, { index, total, prompt }) {
         <button class="btn is-quiet" id="skip">${total > 1 ? "Skip this one" : "Cancel"}</button>
         <button class="btn is-primary" id="save">Add to my week</button>
       </div>
-      <p class="muted small" style="margin-top:12px">${wk === state.weekStart ? "Sealed until everyone taps reveal." : `Taken ${weekLabel(wk)}, so it files under that week.`}</p>`,
+      ${total - index > 0 ? `<button class="btn is-quiet is-block" id="rest" style="margin-top:6px">Add this and the other ${total - index} without details</button>` : ""}
+      <p class="muted small" style="margin-top:12px">${wk === state.weekStart ? (isRevealed() ? "This week is already open, so this photo will be visible right away." : "Sealed until everyone taps reveal.") : `Taken ${weekLabel(wk)}, so it files under that week.`}</p>`,
       { onClose: () => resolve("skip") });
 
     const cap = $("#cap", wrap);
@@ -705,6 +821,14 @@ function detailsSheet(file, { index, total, prompt }) {
       btn.disabled = false; btn.textContent = "Write one for me";
     };
     $("#skip", wrap).onclick = () => { closeSheet(wrap); resolve(total > 1 ? "skip" : "cancel"); };
+    $("#rest", wrap)?.addEventListener("click", async (e) => {
+      e.currentTarget.disabled = true;
+      const id = crypto.randomUUID();
+      const path = `${state.circle.id}/${wk}/${state.me.id}/${id}.jpg`;
+      const up = await sb.storage.from("photos").upload(path, full, { contentType: "image/jpeg", upsert: false });
+      if (!up.error) await sb.from("photos").insert({ id, circle_id: state.circle.id, week_start: wk, taken_at: takenAt.toISOString(), storage_path: path, blur_data: blur, caption: cap.value.trim() || null, place_name: $("#place", wrap).value.trim() || null, lat, lng, prompt: usePrompt ? prompt : null });
+      closeSheet(wrap); resolve("rest");
+    });
     $("#save", wrap).onclick = async (e) => {
       const btn = e.currentTarget; btn.disabled = true; btn.textContent = "Uploading...";
       const id = crypto.randomUUID();
@@ -722,39 +846,121 @@ function detailsSheet(file, { index, total, prompt }) {
 
 // ---------------- Lightbox ----------------
 function openLightbox(id) {
-  const p = state.photos.find((x) => x.id === id);
-  if (!p || !p.storage_path) return;
-  const mine = p.user_id === state.me.id;
-  const who = mine ? state.me : memberById(p.user_id);
+  const list = state.photos.filter((x) => x.storage_path);
+  let i = list.findIndex((x) => x.id === id);
+  if (i < 0) return;
   const el = document.createElement("div");
   el.className = "lightbox";
+  let touchX = null;
   const draw = () => {
+    const p = list[i];
+    const mine = p.user_id === state.me.id;
+    const who = mine ? state.me : memberById(p.user_id);
     const reacts = state.reactions.filter((r) => r.photo_id === p.id);
     el.innerHTML = `
-      <div class="show-top" style="display:flex;justify-content:space-between;align-items:center;padding:calc(var(--safe-top) + 12px) 16px 8px">
-        <span class="row">${avatar(who, "is-small")}${esc(mine ? "You" : who.display_name)} <span class="muted small">${dayLabel(p.taken_at)}, ${timeLabel(p.taken_at)}</span></span>
-        <button class="btn is-quiet" id="close">Close</button>
+      <div class="show-top">
+        <span class="who">${avatar(who, "is-small")}${esc(mine ? "You" : who.display_name)} <span class="muted small">${dayLabel(p.taken_at)}, ${timeLabel(p.taken_at)}</span></span>
+        <div class="row"><button class="btn is-quiet" id="more" aria-label="More">•••</button><button class="btn is-quiet" id="close">Close</button></div>
       </div>
       <div class="lb-img"><img src="${urlFor(p.storage_path)}" alt="" /></div>
       <div class="lb-meta">
-        ${p.prompt ? `<div class="small" style="color:var(--gold)">${esc(p.prompt)}</div>` : ""}
-        <div class="show-caption" style="font-family:var(--display);font-size:1.2rem;margin:6px 0 4px">${esc(p.caption || "")}</div>
+        ${p.prompt ? `<div class="small" style="color:var(--accent)">${esc(p.prompt)}</div>` : ""}
+        <div class="show-caption">${esc(p.caption || "")}</div>
         ${p.place_name ? `<div class="muted small">${esc(p.place_name)}</div>` : ""}
-        ${isRevealed() ? reactionsHtml(p.id, reacts) : ""}
-        ${mine ? `<div class="row end" style="margin-top:10px"><button class="btn is-danger" id="del">Delete</button></div>` : ""}
+        ${isRevealed() ? reactionsHtml(p.id, reacts) + commentsHtml(p.id) : ""}
+        <div class="row between" style="margin-top:10px">
+          <button class="btn is-quiet" id="prev" ${i === 0 ? "disabled" : ""}>‹ Prev</button>
+          <span class="muted small">${i + 1} of ${list.length}</span>
+          <button class="btn is-quiet" id="next" ${i === list.length - 1 ? "disabled" : ""}>Next ›</button>
+        </div>
       </div>`;
     $("#close", el).onclick = () => el.remove();
-    $("#del", el)?.addEventListener("click", async () => {
-      if (!confirm("Delete this photo?")) return;
-      await sb.from("photos").delete().eq("id", p.id);
-      await sb.storage.from("photos").remove([p.storage_path]);
-      el.remove(); await loadWeek(); rerender();
-    });
+    $("#prev", el).onclick = () => { if (i > 0) { i--; draw(); } };
+    $("#next", el).onclick = () => { if (i < list.length - 1) { i++; draw(); } };
+    $("#more", el).onclick = () => photoMenu(p, { onChange: () => { const j = list.findIndex((x) => x.id === p.id); if (j < 0) { el.remove(); rerender(); } else draw(); } });
     wireReactions(el, p.id, draw);
+    wireComments(el, p.id, draw);
   };
+  el.addEventListener("touchstart", (e) => { touchX = e.touches[0].clientX; }, { passive: true });
+  el.addEventListener("touchend", (e) => {
+    if (touchX == null) return; const dx = e.changedTouches[0].clientX - touchX; touchX = null;
+    if (Math.abs(dx) < 60 || e.target.closest("input,textarea,button")) return;
+    if (dx < 0 && i < list.length - 1) { i++; draw(); } else if (dx > 0 && i > 0) { i--; draw(); }
+  });
   draw();
   document.body.appendChild(el);
 }
+
+// The "..." menu on a photo: save, edit, delete, report
+function photoMenu(p, { onChange } = {}) {
+  const mine = p.user_id === state.me.id;
+  const url = urlFor(p.storage_path);
+  const wrap = openSheet(`
+    <div class="menu">
+      ${url ? `<a class="menu-item" href="${url}" download="our-week-${p.id.slice(0, 8)}.jpg" target="_blank" rel="noopener">Save photo</a>` : ""}
+      ${mine ? `<button class="menu-item" id="edit">Edit caption and place</button>` : ""}
+      ${mine ? `<button class="menu-item is-danger" id="del">Delete photo</button>` : `<button class="menu-item is-danger" id="report">Report photo</button>`}
+      <button class="menu-item" id="cancel">Cancel</button>
+    </div>`);
+  $("#cancel", wrap).onclick = () => closeSheet(wrap);
+  $("#edit", wrap)?.addEventListener("click", () => { closeSheet(wrap); editPhotoSheet(p, onChange); });
+  $("#del", wrap)?.addEventListener("click", async () => {
+    if (!confirm("Delete this photo?")) return;
+    await sb.from("photos").delete().eq("id", p.id);
+    await sb.storage.from("photos").remove([p.storage_path]);
+    closeSheet(wrap); await loadWeek(); onChange?.();
+  });
+  $("#report", wrap)?.addEventListener("click", async () => {
+    const reason = prompt("What's wrong with this photo? (optional)") ;
+    if (reason === null) return;
+    const { error } = await sb.from("reports").insert({ photo_id: p.id, circle_id: state.circle.id, reason: reason || null });
+    if (error) return toast(error.message, 4000);
+    lsSet("hiddenPhotos", [...hiddenPhotos(), p.id]);
+    closeSheet(wrap); toast("Reported and hidden for you."); await loadWeek(); onChange?.();
+  });
+}
+
+function editPhotoSheet(p, onChange) {
+  const wrap = openSheet(`
+    <h2>Edit photo</h2>
+    <div class="field"><label for="ecap">Caption</label><textarea id="ecap" class="input">${esc(p.caption || "")}</textarea></div>
+    <div class="field"><label for="eplace">Where</label><input id="eplace" class="input" value="${esc(p.place_name || "")}" /></div>
+    <div class="row end"><button class="btn is-quiet" id="ecancel">Cancel</button><button class="btn is-primary" id="esave">Save</button></div>`);
+  $("#ecancel", wrap).onclick = () => closeSheet(wrap);
+  $("#esave", wrap).onclick = async () => {
+    const patch = { caption: $("#ecap", wrap).value.trim() || null, place_name: $("#eplace", wrap).value.trim() || null };
+    const { error } = await sb.from("photos").update(patch).eq("id", p.id);
+    if (error) return toast(error.message, 4000);
+    Object.assign(p, patch);
+    closeSheet(wrap); toast("Saved"); await loadWeek(); onChange?.();
+  };
+}
+
+// ---------------- Comments ----------------
+function commentsHtml(photoId) {
+  const list = state.comments.filter((c) => c.photo_id === photoId);
+  return `<div class="comments">
+    ${list.map((c) => { const who = c.user_id === state.me.id ? state.me : memberById(c.user_id); return `<div class="comment">${avatar(who, "is-small")}<div class="comment-body"><b>${esc(c.user_id === state.me.id ? "You" : who.display_name)}</b> ${esc(c.body)}</div>${c.user_id === state.me.id ? `<button class="comment-del" data-del="${c.id}" aria-label="Delete">×</button>` : ""}</div>`; }).join("")}
+    <div class="comment-form"><input class="input" data-comment="${photoId}" placeholder="Add a comment" maxlength="500" /><button class="btn is-primary" data-send="${photoId}">Send</button></div>
+  </div>`;
+}
+function wireComments(root, photoId, redraw) {
+  const input = root.querySelector(`[data-comment="${photoId}"]`);
+  const send = async () => {
+    const body = input?.value.trim(); if (!body) return;
+    input.value = ""; input.blur();
+    const { error } = await sb.from("comments").insert({ photo_id: photoId, body });
+    if (error) return toast(error.message, 4000);
+    await loadWeek(); redraw();
+  };
+  root.querySelector(`[data-send="${photoId}"]`)?.addEventListener("click", send);
+  input?.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+  root.querySelectorAll("[data-del]").forEach((b) => b.onclick = async () => {
+    state.comments = state.comments.filter((c) => c.id !== b.dataset.del); redraw();
+    await sb.from("comments").delete().eq("id", b.dataset.del);
+  });
+}
+
 function reactionsHtml(photoId, reacts) {
   return `<div class="reacts">${CONFIG.REACTIONS.map((e) => {
     const these = reacts.filter((r) => r.emoji === e);
@@ -798,13 +1004,22 @@ function renderReveal() {
   let action;
   if (revealed) {
     action = `<button class="btn is-primary is-block" id="watch">Watch the week together</button>
-      <p class="muted small" style="margin-top:12px;text-align:center">Slides stay in sync on everyone's phone. Anyone can tap next.</p>`;
+      <p class="muted small" style="margin-top:12px;text-align:center">Slides stay in sync on everyone's phone. Anyone can tap next.</p>
+      <button class="btn is-ghost is-block" id="newweek" style="margin-top:14px">Start a new week now</button>
+      <p class="muted small" style="margin-top:8px;text-align:center">Otherwise the next week starts on its own ${DAYS[(state.circle.reveal_day + 1) % 7]}.</p>`;
   } else if (!state.photos.length) {
     action = `<div class="empty">Nothing to reveal yet. Once people add photos, this is where you open the week.</div>`;
   } else if (iAmReady()) {
+    const owner = state.members.find((m) => m.user_id === state.me.id)?.role === "owner";
+    const pastDue = Date.now() >= revealAt.getTime();
+    const pastGrace = Date.now() >= revealAt.getTime() + 24 * 3600000;
+    const canForce = (owner && pastDue) || pastGrace;
     action = `<div style="text-align:center">
       <span class="waiting"><span class="pulse"></span>Waiting on ${waitingOn.length === 1 ? esc(memberById(waitingOn[0]).display_name) : `${waitingOn.length} people`}</span>
-      <div style="margin-top:14px"><button class="btn is-quiet" id="unready">Never mind</button></div></div>`;
+      <div style="margin-top:14px"><button class="btn is-quiet" id="unready">Never mind</button></div>
+      ${canForce ? `<div style="margin-top:18px"><button class="btn is-ghost is-block" id="force">Open without waiting</button><p class="muted small" style="margin-top:8px">${owner ? "You're the owner and the reveal time has passed." : "It's been over a day since the reveal time, so anyone can open it."}</p></div>`
+        : pastDue ? `<p class="muted small" style="margin-top:14px">If they still haven't tapped by ${new Date(revealAt.getTime() + 24 * 3600000).toLocaleString(undefined, { weekday: "short", hour: "numeric" })}, anyone can open it. The owner can open it now.</p>` : ""}
+    </div>`;
   } else {
     const lastOne = waitingOn.length === 1 && waitingOn[0] === state.me.id;
     action = `<button class="btn ${lastOne ? "is-primary" : ""} is-block" id="ready">${lastOne ? "Open the week" : "I'm ready to reveal"}</button>
@@ -835,12 +1050,33 @@ function renderReveal() {
     await loadWeek();
     if (!isRevealed()) renderReveal();
   });
+  $("#force")?.addEventListener("click", async () => {
+    if (!confirm("Open this week now, even though not everyone has tapped?")) return;
+    const { error } = await sb.rpc("force_reveal", { p_circle: state.circle.id, p_week: state.weekStart });
+    if (error) return toast(error.message, 4500);
+    await loadWeek();
+  });
   $("#unready")?.addEventListener("click", async () => {
     await sb.from("reveal_ready").delete().match({ circle_id: state.circle.id, week_start: state.weekStart, user_id: state.me.id });
     await loadWeek(); renderReveal();
   });
   $("#watch")?.addEventListener("click", () => startSlideshow());
+  $("#newweek")?.addEventListener("click", startNewWeek);
   $("#pickfav")?.addEventListener("click", () => startSlideshow({ atEnd: true }));
+}
+
+async function startNewWeek() {
+  const next = revealTimeFor(todayIso(state.circle), state.circle);
+  if (!confirm(`Start a new week now? Photos added from here on go into a fresh sealed week that opens ${next.toLocaleDateString(undefined, { weekday: "long" })} at ${hourLabel(state.circle.reveal_hour)}. The week you just opened stays in Past.`)) return;
+  const { data, error } = await sb.rpc("start_new_week", { p_circle: state.circle.id, p_today: todayIso(state.circle), p_current_week: state.weekStart });
+  if (error) return toast(error.message, 4500);
+  Object.assign(state.circle, data);
+  state.weekStart = weekStartFor(new Date(), state.circle);
+  state.urls = new Map();
+  await loadWeek();
+  lastRevealed = isRevealed();
+  toast("Fresh week. Everything's sealed again.");
+  setTab("week");
 }
 
 function renderFavoritesSummary() {
@@ -883,6 +1119,7 @@ async function startSlideshow({ atEnd = false } = {}) {
   await signUrls(state.photos.map((p) => p.storage_path));
   const el = document.createElement("div"); el.className = "show"; document.body.appendChild(el);
   const slides = slideOrder();
+  if (!slides.length) { el.remove(); state.show = null; return toast("No photos this week"); }
   const total = slides.length + 1;
   let idx = atEnd ? total - 1 : Math.min(state.revealState?.slide_index ?? 0, total - 1);
   const captionShown = new Set();
@@ -912,7 +1149,7 @@ async function startSlideshow({ atEnd = false } = {}) {
     const hidden = !mine && p.caption && !captionShown.has(p.id);
     const reacts = state.reactions.filter((r) => r.photo_id === p.id);
     el.innerHTML = `
-      ${top(`${avatar(who, "is-small")}${esc(mine ? "You" : who.display_name)}<span class="muted small">${dayLabel(p.taken_at)}, ${timeLabel(p.taken_at)}</span>`)}
+      ${top(`${avatar(who, "is-small")}${esc(mine ? "You" : who.display_name)}<span class="muted small">${dayLabel(p.taken_at)}, ${timeLabel(p.taken_at)}</span><button class="btn is-quiet" id="more" aria-label="More" style="padding:4px 8px">•••</button>`)}
       <div class="progress"><i style="width:${((idx + 1) / total) * 100}%"></i></div>
       <div class="show-img"><img src="${urlFor(p.storage_path) || p.blur_data}" alt="" /></div>
       <div class="show-meta">
@@ -920,6 +1157,7 @@ async function startSlideshow({ atEnd = false } = {}) {
         ${hidden ? `<button class="caption-hidden" id="showcap">${esc(who.display_name)} wrote a caption. Guess, then tap to see.</button>` : `<div class="show-caption">${esc(p.caption || "")}</div>`}
         ${p.place_name ? `<div class="muted small">${esc(p.place_name)}</div>` : ""}
         ${reactionsHtml(p.id, reacts)}
+        ${commentsHtml(p.id)}
         <div class="show-nav">
           <button class="btn is-ghost" id="prev" ${idx === 0 ? "disabled" : ""}>Back</button>
           <span class="sync-note">${idx + 1} of ${slides.length}</span>
@@ -929,6 +1167,8 @@ async function startSlideshow({ atEnd = false } = {}) {
     wire();
     $("#showcap", el)?.addEventListener("click", () => { captionShown.add(p.id); draw(); });
     wireReactions(el, p.id, draw);
+    wireComments(el, p.id, draw);
+    $("#more", el)?.addEventListener("click", () => photoMenu(p, { onChange: () => draw() }));
   };
 
   const drawFavorites = () => {
@@ -965,7 +1205,7 @@ async function startSlideshow({ atEnd = false } = {}) {
     $("#next", el)?.addEventListener("click", () => show.goTo(idx + 1));
   };
   el.addEventListener("touchstart", (e) => { touchX = e.touches[0].clientX; }, { passive: true });
-  el.addEventListener("touchend", (e) => { if (touchX == null) return; const dx = e.changedTouches[0].clientX - touchX; touchX = null; if (Math.abs(dx) > 60) show.goTo(idx + (dx < 0 ? 1 : -1)); });
+  el.addEventListener("touchend", (e) => { if (touchX == null) return; const dx = e.changedTouches[0].clientX - touchX; touchX = null; if (Math.abs(dx) > 60 && !e.target.closest("input,textarea,button,.comments")) show.goTo(idx + (dx < 0 ? 1 : -1)); });
   draw();
 }
 
@@ -989,8 +1229,8 @@ async function renderPast() {
     if (rs.size > 0 && [...contribs].every((u) => rs.has(u))) revealedSet.add(w);
   }
   const list = [...weeks.keys()].sort().reverse().filter((w) => w !== state.weekStart);
-  let streak = 0; const cursor = weekStartOf(new Date(), state.circle); cursor.setDate(cursor.getDate() - 7);
-  while (revealedSet.has(isoDate(cursor))) { streak++; cursor.setDate(cursor.getDate() - 7); }
+  let streak = 0; let cursor = shiftIso(calendarWeekIso(new Date(), state.circle), -7);
+  while (revealedSet.has(cursor)) { streak++; cursor = shiftIso(cursor, -7); }
   await signUrls((photos || []).map((p) => p.storage_path));
   view.innerHTML = `
     ${circleBar()}
@@ -1073,7 +1313,7 @@ function renderPeople() {
       </div>
     </div>`}
     <section class="person-section" style="margin-top:20px">
-      ${state.members.map((m) => `<div class="member-row">${avatar(m.profile)}<span class="name">${esc(m.profile.display_name)}${m.user_id === state.me.id ? ' <span class="muted small">(you)</span>' : ""}</span><span class="role">${m.role === "owner" ? "owner" : ""}</span>${owner && m.user_id !== state.me.id ? `<button class="btn is-quiet" data-remove="${m.user_id}">Remove</button>` : ""}</div>`).join("")}
+      ${state.members.map((m) => `<div class="member-row">${avatar(m.profile)}<span class="name">${esc(m.profile.display_name)}${m.user_id === state.me.id ? ' <span class="muted small">(you)</span>' : ""}</span><span class="role">${m.role === "owner" ? "owner" : ""}</span>${owner && m.user_id !== state.me.id ? `<button class="btn is-quiet" data-makeowner="${m.user_id}" style="padding:8px 6px">Make owner</button><button class="btn is-quiet" data-remove="${m.user_id}" style="color:var(--danger)">Remove</button>` : ""}</div>`).join("")}
     </section>
     ${owner && state.members.length > 1 ? `<p class="muted small" style="margin-bottom:12px">If you leave, the longest-standing member becomes the owner.</p>` : ""}
     <button class="btn is-danger" id="leave">Leave circle</button>`;
@@ -1085,6 +1325,14 @@ function renderPeople() {
   });
   $("#copy")?.addEventListener("click", async () => { await navigator.clipboard.writeText(c.invite_code); toast("Code copied"); });
   $("#settings")?.addEventListener("click", circleSettingsSheet);
+  view.querySelectorAll("[data-makeowner]").forEach((b) => b.onclick = async () => {
+    const who = memberById(b.dataset.makeowner);
+    if (!confirm(`Make ${who.display_name} the owner of ${c.name}? You'll become a regular member.`)) return;
+    const r1 = await sb.from("circle_members").update({ role: "owner" }).match({ circle_id: c.id, user_id: b.dataset.makeowner });
+    if (r1.error) return toast(r1.error.message, 4000);
+    await sb.from("circle_members").update({ role: "member" }).match({ circle_id: c.id, user_id: state.me.id });
+    await loadMembers(); renderPeople(); toast(`${who.display_name} is now the owner`);
+  });
   view.querySelectorAll("[data-remove]").forEach((b) => b.onclick = async () => {
     const who = memberById(b.dataset.remove);
     if (!confirm(`Remove ${who.display_name} from ${c.name}? Their photos here go too.`)) return;
@@ -1119,12 +1367,22 @@ function circleSettingsSheet() {
       <div class="field" style="flex:1"><label for="sday">Reveal day</label><select id="sday" class="input">${DAYS.map((d, i) => `<option value="${i}" ${i === c.reveal_day ? "selected" : ""}>${d}</option>`).join("")}</select></div>
       <div class="field" style="flex:1"><label for="shour">Time</label><select id="shour" class="input">${Array.from({ length: 24 }, (_, h) => `<option value="${h}" ${h === c.reveal_hour ? "selected" : ""}>${hourLabel(h)}</option>`).join("")}</select></div>
     </div>
+    <div class="field"><label>Time zone</label><div class="row between"><span>${esc(tzLabel(circleTz(c)))}</span>${circleTz(c) !== DEVICE_TZ ? `<button class="chip" id="usetz">Use mine (${esc(tzLabel(DEVICE_TZ))})</button>` : `<span class="muted small">Same as yours</span>`}</div></div>
     <p class="muted small" style="margin-bottom:14px">Changing the reveal day shifts which days count as "this week". Photos already added keep the week they were filed under.</p>
     <div class="field"><label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" id="slock" ${c.locked ? "checked" : ""} /> Lock the circle (no new members)</label></div>
     <div class="row between" style="margin-top:8px">
       <button class="btn is-quiet" id="regen">New invite code</button>
       <button class="btn is-primary" id="ssave">Save</button>
-    </div>`);
+    </div>
+    <div style="margin-top:22px;padding-top:14px;border-top:1px solid var(--line)"><button class="btn is-danger" id="delcircle" style="padding-left:0">Delete this circle</button><p class="muted small">Removes every photo in it for everyone. Can't be undone.</p></div>`);
+  $("#delcircle", wrap).onclick = async () => {
+    if (prompt(`Type the circle's name (${c.name}) to delete it`) !== c.name) return;
+    const { error } = await sb.from("circles").delete().eq("id", c.id);
+    if (error) return toast(error.message, 4000);
+    closeSheet(wrap); toast("Circle deleted"); go("#/");
+  };
+  let newTz = null;
+  $("#usetz", wrap)?.addEventListener("click", (e) => { newTz = DEVICE_TZ; e.currentTarget.textContent = "Will use " + tzLabel(DEVICE_TZ); e.currentTarget.classList.add("is-on"); });
   $("#regen", wrap).onclick = async () => {
     if (!confirm("Old links and the old code will stop working. Continue?")) return;
     const { data, error } = await sb.rpc("regenerate_invite_code", { p_circle: c.id });
@@ -1133,10 +1391,11 @@ function circleSettingsSheet() {
   };
   $("#ssave", wrap).onclick = async () => {
     const patch = { name: $("#sname", wrap).value.trim() || c.name, emoji: $("#semoji", wrap).value.trim() || "📷", reveal_day: Number($("#sday", wrap).value), reveal_hour: Number($("#shour", wrap).value), locked: $("#slock", wrap).checked };
+    if (newTz) patch.timezone = newTz;
     const { error } = await sb.from("circles").update(patch).eq("id", c.id);
     if (error) return toast(error.message, 4000);
     Object.assign(state.circle, patch);
-    state.weekStart = isoDate(weekStartOf(new Date(), state.circle));
+    state.weekStart = weekStartFor(new Date(), state.circle);
     await loadWeek();
     closeSheet(wrap); renderPeople(); toast("Saved");
   };
@@ -1155,6 +1414,7 @@ function renderMe() {
     <div class="setting"><div class="muted small" style="margin-bottom:8px">Appearance</div>
       <div class="seg" id="theme">${[["midnight","Midnight"],["paper","Paper"],["ocean","Ocean"]].map(([k, l]) => `<button data-t="${k}" class="${currentTheme() === k ? "is-on" : ""}">${l}</button>`).join("")}</div></div>
     <div class="setting"><div class="muted small">On iPhone</div><p style="margin:4px 0 0">Open this in Safari, tap Share, then "Add to Home Screen" to get it as an app.</p></div>
+    <div class="setting"><button class="btn is-ghost" id="changepw">Change password</button></div>
     <div class="setting"><button class="btn is-ghost" id="signout">Sign out</button></div>
     <div class="setting"><button class="btn is-danger" id="delete">Delete my account</button><p class="muted small" style="margin-top:6px">Removes you from every circle and deletes your photos. Can't be undone.</p></div>`;
   $("#savename").onclick = async () => {
@@ -1164,6 +1424,19 @@ function renderMe() {
   };
   view.querySelectorAll(".swatch").forEach((b) => b.onclick = async () => { await sb.from("profiles").update({ color: b.dataset.c }).eq("id", state.me.id); state.me.color = b.dataset.c; renderMe(); });
   view.querySelectorAll("#theme button").forEach((b) => b.onclick = () => { applyTheme(b.dataset.t); renderMe(); });
+  $("#changepw").onclick = () => {
+    const wrap = openSheet(`<h2>Change password</h2>
+      <div class="field"><label for="npw">New password</label><input id="npw" class="input" type="password" autocomplete="new-password" placeholder="At least 8 characters" /></div>
+      <div class="error-text" id="pwerr"></div>
+      <button class="btn is-primary is-block" id="pwsave">Save</button>`);
+    $("#pwsave", wrap).onclick = async () => {
+      const pw = $("#npw", wrap).value;
+      if (pw.length < 8) return ($("#pwerr", wrap).textContent = "Use at least 8 characters");
+      const { error } = await sb.auth.updateUser({ password: pw });
+      if (error) return ($("#pwerr", wrap).textContent = error.message);
+      closeSheet(wrap); toast("Password changed");
+    };
+  };
   $("#signout").onclick = async () => { await sb.auth.signOut(); location.hash = ""; location.reload(); };
   $("#delete").onclick = async () => {
     if (!confirm("Delete your account and all your photos? This can't be undone.")) return;
@@ -1201,6 +1474,12 @@ async function boot() {
   if (!location.hash || location.hash === "#/") go("#/"); else route();
   setInterval(() => { if (state.circle && state.tab === "week" && !state.show && !sheetRoot.children.length) renderWeek(); }, 60000);
 }
+
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState !== "visible" || !state.session || state.show || sheetRoot.children.length) return;
+  if (state.circle) { await loadWeek(); rerender(); }
+  else if (location.hash === "" || location.hash === "#/") renderHome();
+});
 
 let booted = false;
 sb.auth.onAuthStateChange((event, session) => {

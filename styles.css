@@ -196,6 +196,7 @@ p { margin: 0; }
 
 .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
 .tile {
+  width: 100%;
   position: relative; aspect-ratio: 1; border-radius: var(--radius-sm); overflow: hidden;
   background: var(--surface-2); border: 0; padding: 0;
   animation: tile-in 0.35s var(--ease) both;
@@ -318,7 +319,8 @@ select.input { appearance: none; -webkit-appearance: none; }
 /* Slideshow */
 .show { position: fixed; inset: 0; background: #000; z-index: 50; display: flex; flex-direction: column; color: #fff; animation: fade 0.25s ease; }
 .show .show-top { display: flex; align-items: center; justify-content: space-between; padding: calc(var(--safe-top) + 12px) 16px 8px; }
-.show .show-top .who { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.show .show-top .who { display: flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; }
+.show .show-top .who .small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .show .show-img { flex: 1; display: grid; place-items: center; min-height: 0; padding: 0 8px; }
 .show .show-img img { max-height: 100%; max-width: 100%; object-fit: contain; border-radius: 12px; animation: slide-in 0.4s var(--ease); }
 @keyframes slide-in { from { opacity: 0; transform: scale(0.97); } }
@@ -354,7 +356,7 @@ select.input { appearance: none; -webkit-appearance: none; }
 :root[data-theme="midnight"] .streak .n { color: #E5C009; }
 
 /* Lightbox */
-.lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.96); z-index: 50; display: flex; flex-direction: column; color: #fff; animation: fade 0.2s ease; }
+.lightbox { position: fixed; inset: 0; background: #000; z-index: 50; display: flex; flex-direction: column; color: #fff; animation: fade 0.2s ease; }
 .lightbox .lb-img { flex: 1; display: grid; place-items: center; min-height: 0; padding: 8px; }
 .lightbox .lb-img img { max-height: 100%; max-width: 100%; object-fit: contain; border-radius: 12px; animation: slide-in 0.3s var(--ease); }
 .lightbox .lb-meta { padding: 12px 20px calc(var(--safe-bottom) + 16px); }
@@ -400,3 +402,35 @@ select.input { appearance: none; -webkit-appearance: none; }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 @media (min-width: 640px) { .grid { grid-template-columns: repeat(4, 1fr); } .fab { right: calc(50% - 320px + 16px); } }
+
+/* ---------- Added in v2.1 ---------- */
+.loading { min-height: 60vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+.spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid var(--surface-2); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.status .new { color: var(--accent); font-weight: 700; }
+:root[data-theme="midnight"] .status .new { color: #E5C009; }
+
+/* Lightbox uses the slideshow's top bar and scrolls its meta area */
+.lightbox .show-top { display: flex; align-items: center; justify-content: space-between; padding: calc(var(--safe-top) + 12px) 16px 8px; }
+.lightbox .show-top .who { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.lightbox .lb-meta, .show .show-meta { max-height: 48vh; overflow: auto; }
+.lightbox .show-caption { font-size: 1.15rem; font-weight: 500; margin: 6px 0 4px; }
+
+/* Action menu sheet */
+.menu { display: flex; flex-direction: column; gap: 6px; }
+.menu-item { display: block; width: 100%; text-align: center; border: 0; background: var(--surface); color: var(--text); padding: 15px; border-radius: 14px; font-weight: 600; text-decoration: none; }
+.menu-item:active { background: var(--surface-2); }
+.menu-item.is-danger { color: var(--danger); }
+
+/* Comments */
+.comments { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.comment { display: flex; align-items: flex-start; gap: 8px; font-size: 0.92rem; }
+.comment .comment-body { flex: 1; min-width: 0; line-height: 1.35; word-wrap: break-word; }
+.comment .comment-body b { font-weight: 600; margin-right: 4px; }
+.comment-del { background: none; border: 0; color: var(--muted); font-size: 1.1rem; padding: 0 4px; line-height: 1; }
+.comment-form { display: flex; gap: 8px; margin-top: 2px; }
+.comment-form .input { padding: 10px 12px; border-radius: 12px; }
+.comment-form .btn { padding: 10px 14px; border-radius: 12px; }
+.show .comment-form .input { background: #1C1C1E; border-color: rgba(255,255,255,0.15); color: #fff; }
+.show .comment-del { color: #8E8E93; }
