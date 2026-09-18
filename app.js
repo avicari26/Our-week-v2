@@ -20,6 +20,7 @@ try {
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $("#view");
 const tabsEl = $("#tabs");
+const homeTabsEl = $("#tabs-home");
 const sheetRoot = $("#sheet-root");
 const fileInput = $("#file-input");
 
@@ -114,13 +115,16 @@ function closeSheet(wrap, onClose) { wrap?.remove(); onClose?.(); }
 //           #/me           profile
 // A /join/CODE link stashes the code, then joins after sign-in.
 // ===============================================================
-(function captureJoinLink() {
-  const m = location.pathname.match(/^\/join\/([A-Za-z0-9]{4,10})\/?$/);
+function captureJoinLink() {
+  const m = location.pathname.match(/^\/join\/([A-Za-z0-9]{4,10})\/?$/) || location.hash.match(/^#\/?join\/([A-Za-z0-9]{4,10})\/?$/);
   if (m) {
     sessionStorage.setItem("pendingJoin", m[1].toUpperCase());
     history.replaceState(null, "", "/");
+    return m[1].toUpperCase();
   }
-})();
+  return null;
+}
+captureJoinLink();
 
 function go(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
 window.addEventListener("hashchange", () => route());
@@ -128,6 +132,8 @@ window.addEventListener("hashchange", () => route());
 async function route() {
   if (!state.session) return;
   if (state.show) return;
+  const joinCode = captureJoinLink();
+  if (joinCode) { sessionStorage.removeItem("pendingJoin"); const ok = await joinByCode(joinCode, null); if (ok) return; }
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   sheetRoot.innerHTML = "";
   if (parts[0] === "c" && parts[1]) {
@@ -140,12 +146,24 @@ async function route() {
     return;
   }
   leaveCircleContext();
-  if (parts[0] === "me") return renderMe();
-  return renderCircles();
+  if (parts[0] === "me") return setHomeTab("me");
+  if (parts[0] === "circles") return setHomeTab("circles");
+  return setHomeTab("home");
 }
+
+function setHomeTab(tab) {
+  tabsEl.hidden = true;
+  homeTabsEl.hidden = false;
+  homeTabsEl.querySelectorAll(".tab").forEach((b) => b.classList.toggle("is-active", b.dataset.tab === tab));
+  if (tab === "me") return renderMe();
+  if (tab === "circles") return renderCircles();
+  return renderHome();
+}
+homeTabsEl.querySelectorAll(".tab").forEach((b) => b.onclick = () => go(b.dataset.tab === "home" ? "#/" : `#/${b.dataset.tab}`));
 
 function setTab(tab) {
   state.tab = tab;
+  homeTabsEl.hidden = true;
   tabsEl.hidden = false;
   tabsEl.querySelectorAll(".tab").forEach((b) => b.classList.toggle("is-active", b.dataset.tab === tab));
   const target = `#/c/${state.circle.id}/${tab}`;
@@ -171,12 +189,12 @@ function rerender() {
 // Auth
 // ===============================================================
 function renderAuth(mode = "signin") {
-  tabsEl.hidden = true;
+  tabsEl.hidden = true; homeTabsEl.hidden = true;
   view.className = "view";
   const pending = sessionStorage.getItem("pendingJoin");
   view.innerHTML = `
     <div class="login">
-      <div class="login-art"><div class="tile"></div><div class="tile"></div><div class="tile"></div></div>
+      <div class="brand"><img src="/icons/icon-192.png" alt="" /></div>
       <h1>${esc(CONFIG.APP_NAME)}</h1>
       <p class="lede">${pending ? `You've been invited to a circle. ${mode === "signin" ? "Sign in" : "Create an account"} to join it.` : "Everyone in a circle seals a week of photos. Nobody sees anyone else's until you all open it together."}</p>
       ${mode === "signup" ? `
@@ -184,7 +202,7 @@ function renderAuth(mode = "signin") {
       <div class="field"><label for="email">Email</label><input id="email" class="input" type="email" autocomplete="email" inputmode="email" /></div>
       <div class="field"><label for="pw">Password</label><input id="pw" class="input" type="password" autocomplete="${mode === "signup" ? "new-password" : "current-password"}" placeholder="${mode === "signup" ? "At least 8 characters" : ""}" /></div>
       <div class="error-text" id="err"></div>
-      <button class="btn is-gold is-block" id="go" style="margin-top:8px">${mode === "signup" ? "Create account" : "Sign in"}</button>
+      <button class="btn is-primary is-block" id="go" style="margin-top:8px">${mode === "signup" ? "Create account" : "Sign in"}</button>
       <div class="auth-toggle">${mode === "signup" ? `Already have an account? <button id="switch">Sign in</button>` : `New here? <button id="switch">Create an account</button>`}</div>
       ${mode === "signin" ? `<div class="auth-toggle"><button id="forgot">Forgot password?</button></div>` : ""}
     </div>`;
@@ -219,12 +237,12 @@ function renderAuth(mode = "signin") {
 }
 
 function renderResetPassword() {
-  tabsEl.hidden = true;
+  tabsEl.hidden = true; homeTabsEl.hidden = true;
   view.className = "view";
   view.innerHTML = `<div class="login"><h1>New password</h1>
     <div class="field"><label for="pw">Password</label><input id="pw" class="input" type="password" autocomplete="new-password" /></div>
     <div class="error-text" id="err"></div>
-    <button class="btn is-gold is-block" id="go">Save</button></div>`;
+    <button class="btn is-primary is-block" id="go">Save</button></div>`;
   $("#go").onclick = async () => {
     const { error } = await sb.auth.updateUser({ password: $("#pw").value });
     if (error) return ($("#err").textContent = error.message);
@@ -235,6 +253,99 @@ function renderResetPassword() {
 async function loadMe() {
   const { data } = await sb.from("profiles").select("*").eq("id", state.session.user.id).maybeSingle();
   state.me = data || { id: state.session.user.id, display_name: state.session.user.email.split("@")[0], color: "#8FC7E8" };
+}
+
+// ===============================================================
+// Home
+// ===============================================================
+function greeting() {
+  const h = new Date().getHours();
+  return h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+}
+
+async function renderHome() {
+  view.className = "view";
+  view.innerHTML = `<div class="screen-head"><div><div class="kicker">${greeting()}</div><h1>${esc(state.me.display_name)}</h1></div></div><p class="muted">Loading...</p>`;
+  await loadCircles();
+  const circles = state.circles;
+
+  // Live status for every circle's current week
+  const status = {};
+  if (circles.length) {
+    const ids = circles.map((c) => c.id);
+    const weeks = Object.fromEntries(circles.map((c) => [c.id, isoDate(weekStartOf(new Date(), c))]));
+    const [{ data: photos }, { data: ready }] = await Promise.all([
+      sb.from("photos_view").select("circle_id,user_id,week_start").in("circle_id", ids),
+      sb.from("reveal_ready").select("circle_id,user_id,week_start").in("circle_id", ids),
+    ]);
+    for (const c of circles) {
+      const ps = (photos || []).filter((p) => p.circle_id === c.id && p.week_start === weeks[c.id]);
+      const rs = new Set((ready || []).filter((r) => r.circle_id === c.id && r.week_start === weeks[c.id]).map((r) => r.user_id));
+      const contribs = [...new Set(ps.map((p) => p.user_id))];
+      const mine = ps.filter((p) => p.user_id === state.me.id).length;
+      const revealed = rs.size > 0 && contribs.every((u) => rs.has(u));
+      const waitingOnMe = !revealed && contribs.includes(state.me.id) && !rs.has(state.me.id) && contribs.filter((u) => !rs.has(u)).length === 1;
+      status[c.id] = { mine, others: ps.length - mine, revealed, waitingOnMe, anyReady: rs.size > 0, revealAt: revealTimeFor(weeks[c.id], c) };
+    }
+  }
+
+  const line = (c) => {
+    const s = status[c.id];
+    if (s.revealed) return `<span class="status is-good">This week is open</span>`;
+    if (s.waitingOnMe) return `<span class="status is-hot">Everyone's waiting on you to reveal</span>`;
+    if (s.anyReady) return `<span class="status is-hot">Someone's ready to reveal</span>`;
+    const parts = [];
+    if (s.others) parts.push(`${s.others} sealed`);
+    parts.push(`${s.mine} from you`);
+    return `<span class="status">${parts.join(", ")} · reveal in ${countdown(s.revealAt)}</span>`;
+  };
+
+  view.innerHTML = `
+    <div class="screen-head">
+      <div><div class="kicker">${greeting()}</div><h1>${esc(state.me.display_name)}</h1></div>
+      <button class="btn is-quiet" id="me" style="padding:0">${avatar(state.me)}</button>
+    </div>
+    <div class="prompt">
+      <div><div class="prompt-label">Today's prompt</div><div class="prompt-text">${esc(promptForDate())}</div></div>
+    </div>
+    <button class="btn is-primary is-block is-big" id="add"><svg viewBox="0 0 24 24" class="ico"><path d="M12 5v14M5 12h14"/></svg>Add a photo</button>
+
+    <section class="home-section">
+      <div class="section-head"><h2>Your circles</h2>${circles.length > 3 ? `<button class="btn is-quiet" id="all">See all</button>` : ""}</div>
+      ${circles.length ? `<div class="list">${circles.slice(0, 3).map((c) => `
+        <button class="list-row" data-id="${c.id}">
+          <span class="emoji">${esc(c.emoji)}</span>
+          <span class="info"><b>${esc(c.name)}</b>${line(c)}</span>
+          <span class="chev">›</span>
+        </button>`).join("")}</div>` : `<div class="empty">You're not in a circle yet. Start one or join a friend's.</div>`}
+    </section>
+
+    <section class="home-section">
+      <div class="section-head"><h2>Do something</h2></div>
+      <div class="action-grid">
+        <button class="action" id="start"><span class="ico-wrap"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg></span>Start a circle</button>
+        <button class="action" id="join"><span class="ico-wrap"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 12h10M7 9h4M7 15h6"/></svg></span>Join with code</button>
+        <button class="action" id="circles"><span class="ico-wrap"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 14.5a5 5 0 0 1 6 5"/></svg></span>All circles</button>
+        <button class="action" id="profile"><span class="ico-wrap"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span>Profile</button>
+      </div>
+    </section>`;
+  $("#me").onclick = () => go("#/me");
+  $("#profile").onclick = () => go("#/me");
+  $("#all")?.addEventListener("click", () => go("#/circles"));
+  $("#circles").onclick = () => go("#/circles");
+  $("#start").onclick = createCircleSheet;
+  $("#join").onclick = () => joinSheet();
+  $("#add").onclick = () => addPhotoFromHome();
+  view.querySelectorAll(".list-row").forEach((b) => b.onclick = () => go(`#/c/${b.dataset.id}/week`));
+}
+
+async function addPhotoFromHome() {
+  const circles = state.circles;
+  if (!circles.length) return toast("Start or join a circle first");
+  const pick = async (id) => { await enterCircle(id); history.replaceState(null, "", `#/c/${id}/week`); setTab("week"); pickFiles(); };
+  if (circles.length === 1) return pick(circles[0].id);
+  const wrap = openSheet(`<h2>Add to which circle?</h2><div class="list">${circles.map((c) => `<button class="list-row" data-id="${c.id}"><span class="emoji">${esc(c.emoji)}</span><span class="info"><b>${esc(c.name)}</b></span><span class="chev">›</span></button>`).join("")}</div>`);
+  wrap.querySelectorAll(".list-row").forEach((b) => b.onclick = () => { closeSheet(wrap); pick(b.dataset.id); });
 }
 
 // ===============================================================
@@ -254,29 +365,26 @@ async function loadCircles() {
 }
 
 async function renderCircles() {
-  tabsEl.hidden = true;
   view.className = "view";
-  view.innerHTML = `<div class="screen-head"><div><div class="kicker">Hi ${esc(state.me.display_name)}</div><h1>Your circles</h1></div></div><p class="muted">Loading...</p>`;
+  view.innerHTML = `<div class="screen-head"><div><h1>Circles</h1></div></div><p class="muted">Loading...</p>`;
   await loadCircles();
   view.innerHTML = `
     <div class="screen-head">
-      <div><div class="kicker">Hi ${esc(state.me.display_name)}</div><h1>Your circles</h1></div>
-      <button class="btn is-quiet" id="me">${avatar(state.me)}</button>
+      <div><div class="kicker">${state.circles.length} ${state.circles.length === 1 ? "circle" : "circles"}</div><h1>Circles</h1></div>
     </div>
-    ${state.circles.length ? state.circles.map((c) => `
-      <button class="circle-card" data-id="${c.id}">
+    ${state.circles.length ? `<div class="list">` + state.circles.map((c) => `
+      <button class="list-row" data-id="${c.id}">
         <span class="emoji">${esc(c.emoji)}</span>
-        <span class="info"><b>${esc(c.name)}</b><span>${c.member_count} ${c.member_count === 1 ? "person" : "people"}, reveals ${DAYS[c.reveal_day]}s</span></span>
-        <span class="arrow">›</span>
-      </button>`).join("") : `<div class="empty" style="margin-bottom:16px">No circles yet. Start one with the people you want to share your weeks with, or join one with a code.</div>`}
+        <span class="info"><b>${esc(c.name)}</b><span class="status">${c.member_count} ${c.member_count === 1 ? "person" : "people"} · reveals ${DAYS[c.reveal_day]}s</span></span>
+        <span class="chev">›</span>
+      </button>`).join("") + `</div>` : `<div class="empty" style="margin-bottom:16px">No circles yet. Start one with the people you want to share your weeks with, or join one with a code.</div>`}
     <div class="row" style="margin-top:14px">
-      <button class="btn is-gold" id="create" style="flex:1">Start a circle</button>
+      <button class="btn is-primary" id="create" style="flex:1">Start a circle</button>
       <button class="btn is-ghost" id="join" style="flex:1">Join with code</button>
     </div>`;
-  $("#me").onclick = () => go("#/me");
   $("#create").onclick = createCircleSheet;
   $("#join").onclick = () => joinSheet();
-  view.querySelectorAll(".circle-card").forEach((b) => b.onclick = () => go(`#/c/${b.dataset.id}/week`));
+  view.querySelectorAll(".list-row").forEach((b) => b.onclick = () => go(`#/c/${b.dataset.id}/week`));
 }
 
 function createCircleSheet() {
@@ -292,7 +400,7 @@ function createCircleSheet() {
     </div>
     <p class="muted small" style="margin-bottom:14px">The week runs from the day after reveal day to reveal day. The time is just a countdown; the week opens whenever everyone taps.</p>
     <div class="error-text" id="cerr"></div>
-    <button class="btn is-gold is-block" id="csave">Create and get invite code</button>`);
+    <button class="btn is-primary is-block" id="csave">Create and get invite code</button>`);
   wrap.querySelectorAll("#emojis .chip").forEach((b) => b.onclick = () => { emoji = b.dataset.e; wrap.querySelectorAll("#emojis .chip").forEach((x) => x.classList.toggle("is-on", x === b)); });
   $("#csave", wrap).onclick = async (e) => {
     e.currentTarget.disabled = true;
@@ -308,7 +416,7 @@ function joinSheet(prefill = "") {
     <h2>Join a circle</h2>
     <div class="field"><label for="jcode">Invite code</label><input id="jcode" class="input" value="${esc(prefill)}" placeholder="ABC123" autocapitalize="characters" autocomplete="off" style="letter-spacing:.15em;font-size:1.3rem;text-align:center" maxlength="6" /></div>
     <div class="error-text" id="jerr"></div>
-    <button class="btn is-gold is-block" id="jgo">Join</button>`);
+    <button class="btn is-primary is-block" id="jgo">Join</button>`);
   const input = $("#jcode", wrap);
   input.addEventListener("input", () => (input.value = input.value.toUpperCase().replace(/[^A-Z0-9]/g, "")));
   $("#jgo", wrap).onclick = () => joinByCode(input.value, wrap);
@@ -573,7 +681,7 @@ function detailsSheet(file, { index, total, prompt }) {
       </div>
       <div class="row between">
         <button class="btn is-quiet" id="skip">${total > 1 ? "Skip this one" : "Cancel"}</button>
-        <button class="btn is-gold" id="save">Add to my week</button>
+        <button class="btn is-primary" id="save">Add to my week</button>
       </div>
       <p class="muted small" style="margin-top:12px">${wk === state.weekStart ? "Sealed until everyone taps reveal." : `Taken ${weekLabel(wk)}, so it files under that week.`}</p>`,
       { onClose: () => resolve("skip") });
@@ -689,7 +797,7 @@ function renderReveal() {
 
   let action;
   if (revealed) {
-    action = `<button class="btn is-gold is-block" id="watch">Watch the week together</button>
+    action = `<button class="btn is-primary is-block" id="watch">Watch the week together</button>
       <p class="muted small" style="margin-top:12px;text-align:center">Slides stay in sync on everyone's phone. Anyone can tap next.</p>`;
   } else if (!state.photos.length) {
     action = `<div class="empty">Nothing to reveal yet. Once people add photos, this is where you open the week.</div>`;
@@ -699,7 +807,7 @@ function renderReveal() {
       <div style="margin-top:14px"><button class="btn is-quiet" id="unready">Never mind</button></div></div>`;
   } else {
     const lastOne = waitingOn.length === 1 && waitingOn[0] === state.me.id;
-    action = `<button class="btn ${lastOne ? "is-gold" : ""} is-block" id="ready">${lastOne ? "Open the week" : "I'm ready to reveal"}</button>
+    action = `<button class="btn ${lastOne ? "is-primary" : ""} is-block" id="ready">${lastOne ? "Open the week" : "I'm ready to reveal"}</button>
       <p class="muted small" style="margin-top:12px;text-align:center">${lastOne ? "Everyone else has tapped. You're the last one." : iContributed ? "Nothing opens until everyone who posted has tapped." : "You didn't post this week, so your tap isn't needed, but you can still tap along."}</p>`;
   }
 
@@ -815,7 +923,7 @@ async function startSlideshow({ atEnd = false } = {}) {
         <div class="show-nav">
           <button class="btn is-ghost" id="prev" ${idx === 0 ? "disabled" : ""}>Back</button>
           <span class="sync-note">${idx + 1} of ${slides.length}</span>
-          <button class="btn is-gold" id="next">${idx === slides.length - 1 ? "Pick favorites" : "Next"}</button>
+          <button class="btn is-primary" id="next">${idx === slides.length - 1 ? "Pick favorites" : "Next"}</button>
         </div>
       </div>`;
     wire();
@@ -841,7 +949,7 @@ async function startSlideshow({ atEnd = false } = {}) {
         <h2 style="margin-top:20px">Everyone else's picks</h2>
         <div class="fav-grid">${others.map(({ m, p }) => `<div><div class="muted small" style="margin-bottom:6px">${esc(m.profile.display_name)}</div>${p ? `<div class="tile"><img src="${urlFor(p.storage_path) || p.blur_data}" alt=""/></div>` : `<div class="tile" style="display:grid;place-items:center;color:var(--muted);font-size:.8rem">Not yet</div>`}</div>`).join("") || `<p class="muted">Just you here.</p>`}</div>
       </div>
-      <div class="show-meta"><div class="show-nav"><button class="btn is-ghost" id="prev">Back</button><button class="btn is-gold" id="finish">Done</button></div></div>`;
+      <div class="show-meta"><div class="show-nav"><button class="btn is-ghost" id="prev">Back</button><button class="btn is-primary" id="finish">Done</button></div></div>`;
     wire();
     $("#finish", el).onclick = () => show.close();
     el.querySelectorAll("[data-fav]").forEach((b) => b.onclick = async () => {
@@ -950,7 +1058,7 @@ function renderPeople() {
   view.className = "view";
   const c = state.circle;
   const owner = c.my_role === "owner" || state.members.find((m) => m.user_id === state.me.id)?.role === "owner";
-  const link = `${location.origin}/join/${c.invite_code}`;
+  const link = `${location.origin}/#/join/${c.invite_code}`;
   view.innerHTML = `
     ${circleBar(owner ? `<button class="btn is-quiet" id="settings">Settings</button>` : "")}
     <div class="screen-head"><div><div class="kicker">${state.members.length} ${state.members.length === 1 ? "person" : "people"}</div><h1>${esc(c.name)}</h1></div></div>
@@ -960,7 +1068,7 @@ function renderPeople() {
       <div class="code">${esc(c.invite_code)}</div>
       <div class="link">${esc(link)}</div>
       <div class="row" style="justify-content:center;margin-top:14px">
-        <button class="btn is-gold" id="share">Share link</button>
+        <button class="btn is-primary" id="share">Share link</button>
         <button class="btn is-ghost" id="copy">Copy code</button>
       </div>
     </div>`}
@@ -1015,7 +1123,7 @@ function circleSettingsSheet() {
     <div class="field"><label class="row" style="gap:10px;cursor:pointer"><input type="checkbox" id="slock" ${c.locked ? "checked" : ""} /> Lock the circle (no new members)</label></div>
     <div class="row between" style="margin-top:8px">
       <button class="btn is-quiet" id="regen">New invite code</button>
-      <button class="btn is-gold" id="ssave">Save</button>
+      <button class="btn is-primary" id="ssave">Save</button>
     </div>`);
   $("#regen", wrap).onclick = async () => {
     if (!confirm("Old links and the old code will stop working. Continue?")) return;
@@ -1036,26 +1144,26 @@ function circleSettingsSheet() {
 
 // ---------------- Me ----------------
 function renderMe() {
-  tabsEl.hidden = true;
   view.className = "view";
   const colors = ["#8FC7E8", "#F3A6BB", "#E9C46A", "#9FE3C0", "#C8A9F0", "#F5B48A", "#8DD3C7", "#F6C1E6"];
   view.innerHTML = `
-    <div class="circle-bar"><button class="back" id="back" aria-label="Back"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button><span class="title">You</span></div>
+    <div class="screen-head"><div><div class="kicker">${esc(state.session.user.email)}</div><h1>You</h1></div>${avatar(state.me)}</div>
     <div class="setting"><label class="muted small" for="name">Your name</label>
       <div class="row" style="margin-top:6px"><input id="name" class="input" value="${esc(state.me.display_name)}" /><button class="btn is-ghost" id="savename">Save</button></div></div>
     <div class="setting"><div class="muted small" style="margin-bottom:8px">Your color</div>
       <div class="swatches">${colors.map((c) => `<button class="swatch ${state.me.color === c ? "is-on" : ""}" data-c="${c}" style="background:${c}" aria-label="${c}"></button>`).join("")}</div></div>
-    <div class="setting"><div class="muted small">Signed in as</div><p style="margin:4px 0 0">${esc(state.session.user.email)}</p></div>
+    <div class="setting"><div class="muted small" style="margin-bottom:8px">Appearance</div>
+      <div class="seg" id="theme">${[["midnight","Midnight"],["paper","Paper"],["ocean","Ocean"]].map(([k, l]) => `<button data-t="${k}" class="${currentTheme() === k ? "is-on" : ""}">${l}</button>`).join("")}</div></div>
     <div class="setting"><div class="muted small">On iPhone</div><p style="margin:4px 0 0">Open this in Safari, tap Share, then "Add to Home Screen" to get it as an app.</p></div>
     <div class="setting"><button class="btn is-ghost" id="signout">Sign out</button></div>
     <div class="setting"><button class="btn is-danger" id="delete">Delete my account</button><p class="muted small" style="margin-top:6px">Removes you from every circle and deletes your photos. Can't be undone.</p></div>`;
-  $("#back").onclick = () => go("#/");
   $("#savename").onclick = async () => {
     const display_name = $("#name").value.trim(); if (!display_name) return;
     await sb.from("profiles").update({ display_name }).eq("id", state.me.id);
     state.me.display_name = display_name; toast("Saved");
   };
   view.querySelectorAll(".swatch").forEach((b) => b.onclick = async () => { await sb.from("profiles").update({ color: b.dataset.c }).eq("id", state.me.id); state.me.color = b.dataset.c; renderMe(); });
+  view.querySelectorAll("#theme button").forEach((b) => b.onclick = () => { applyTheme(b.dataset.t); renderMe(); });
   $("#signout").onclick = async () => { await sb.auth.signOut(); location.hash = ""; location.reload(); };
   $("#delete").onclick = async () => {
     if (!confirm("Delete your account and all your photos? This can't be undone.")) return;
@@ -1065,6 +1173,19 @@ function renderMe() {
     await sb.auth.signOut(); location.hash = ""; location.reload();
   };
 }
+
+// ===============================================================
+// Appearance
+// ===============================================================
+const DEFAULT_THEME = "midnight";
+function currentTheme() { try { return localStorage.getItem("theme") || DEFAULT_THEME; } catch { return DEFAULT_THEME; } }
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("theme", t); } catch {}
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#000";
+}
+document.documentElement.dataset.theme = currentTheme();
 
 // ===============================================================
 // Boot

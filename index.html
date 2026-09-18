@@ -12,9 +12,6 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Our Week" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,400;9..144,600;9..144,700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -45,6 +42,20 @@
 
   <div id="app">
     <main id="view" class="view"></main>
+    <nav id="tabs-home" class="tabs" hidden>
+      <button data-tab="home" class="tab is-active" aria-label="Home">
+        <svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a2 2 0 0 1-2 2h-4v-6H9v6H5a2 2 0 0 1-2-2z"/></svg>
+        <span>Home</span>
+      </button>
+      <button data-tab="circles" class="tab" aria-label="Circles">
+        <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><circle cx="17" cy="9" r="2.5"/><path d="M15.5 14.5a5 5 0 0 1 6 5"/></svg>
+        <span>Circles</span>
+      </button>
+      <button data-tab="me" class="tab" aria-label="Me">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+        <span>Me</span>
+      </button>
+    </nav>
     <nav id="tabs" class="tabs" hidden>
       <button data-tab="week" class="tab is-active" aria-label="This week">
         <svg viewBox="0 0 24 24"><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5z"/><path d="M4 15l4.2-4.2a1 1 0 0 1 1.4 0L14 15"/><path d="M13 14l2-2a1 1 0 0 1 1.4 0L20 15.6"/><circle cx="15.5" cy="8.5" r="1.3"/></svg>
