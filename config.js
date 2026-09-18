@@ -6,11 +6,12 @@
 // Never put a secret key (sb_secret_) here. This file is sent to every browser.
 
 export const CONFIG = {
-  SUPABASE_URL: "https://advroacjsgincnfnjhkf.supabase.co/rest/v1/",
+  SUPABASE_URL: "https://advroacjsgincnfnjhkf.supabase.co",
   SUPABASE_PUBLISHABLE_KEY: "sb_publishable_jqj9PZBGQb5G47sjhB5n7Q_WabT91MK",
 
   APP_NAME: "Our Week",
-
+  VAPID_PUBLIC_KEY: "BMDpCCqe4v6eS5JHIojDb4MSmwBApD-08YdYfJvUQQlm7BfvMM9eBPw_prkT0TZ3_qzcLqAmMjcdSL7r9skhmSc",
+  
   // Photo settings
   MAX_EDGE: 1600,       // longest side after compression, in pixels
   JPEG_QUALITY: 0.82,
